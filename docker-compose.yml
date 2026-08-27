@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: qpinoy-db
+    environment:
+      POSTGRES_USER: qpinoy
+      POSTGRES_PASSWORD: qpinoy
+      POSTGRES_DB: qpinoy
+    ports:
+      # Host port 5433 on purpose: if you already run Postgres locally
+      # on 5432, this won't collide with it.
+      - '5433:5432'
+    volumes:
+      - qpinoy_pgdata:/var/lib/postgresql/data
+      # Scripts in this directory run automatically, in alphabetical
+      # order, the FIRST time the volume is initialised. They do NOT
+      # re-run on subsequent `up` once the volume exists — use
+      # `npm run db:reset` (or `docker compose down -v`) to start over.
+      - ./backend/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./backend/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    healthcheck:
+      # The API's `npm run dev` waits on this, so it can't start
+      # querying before Postgres is genuinely ready to accept
+      # connections (the container reports "up" well before that).
+      test: ['CMD-SHELL', 'pg_isready -U qpinoy -d qpinoy']
+      interval: 3s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+volumes:
+  qpinoy_pgdata:

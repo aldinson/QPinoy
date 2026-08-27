@@ -1,0 +1,25 @@
+{
+  "name": "qpinoy-backend",
+  "version": "1.0.0",
+  "description": "Presence vs Payment queue engine — REST API and Postgres access layer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test",
+    "test:unit": "node --test queueCore.test.js geofence.test.js distanceMatrixClient.test.js",
+    "test:integration": "node --test queueEngine.integration.test.js routes.integration.test.js",
+    "db:schema": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f schema.sql",
+    "db:seed": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f seed.sql",
+    "db:setup": "npm run db:schema && npm run db:seed",
+    "smoke": "node smoke.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.12.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
