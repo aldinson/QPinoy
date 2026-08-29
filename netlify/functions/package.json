@@ -1,0 +1,9 @@
+{
+  "name": "qpinoy-netlify-functions",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Dependencies for the Netlify Function wrapper only (backend/app.js pulls its own express/pg from backend/node_modules).",
+  "dependencies": {
+    "serverless-http": "^3.2.0"
+  }
+}

@@ -32,51 +32,108 @@ Three pieces:
 
 | Piece | What it is | Notes |
 |---|---|---|
-| **Postgres** | Managed database | Neon, Supabase, Render Postgres, or Railway. Free tiers are fine to start. |
-| **Backend API** | Node/Express container | Render, Railway, or Fly.io. A `Dockerfile` is included. |
-| **Frontend** | Static files from `npm run build` | Any static host, or serve from the same box as the API. |
+| **Postgres** | Managed database | Neon (recommended — see below), Supabase, Render Postgres, or Railway. Free tiers are fine to start. |
+| **Backend API** | The Express app in `backend/` | Either as a Netlify Function (recommended, see §3) or as a normal always-on service on Render/Railway/Fly (§3b). A `Dockerfile` is included for the latter. |
+| **Frontend** | Static files from `npm run build` | Netlify, or any static host. |
 
 ### Recommended: single origin
 
-Serve the frontend and API from **one domain**
-(`qpinoy.example.com`, with the API at `/api/*`). This means:
+Serve the frontend and API from **one domain** (the API at `/api/*`).
+This means:
 
 - No CORS configuration at all
 - Service worker scope covers everything cleanly
 - Cookies/auth work without `SameSite` headaches later
 - Matches the Vite dev proxy, so dev and prod behave identically
 
-If you must split them across domains, set `CORS_ORIGINS` on the API
-(explicit allowlist — see `.env.example`) and `VITE_API_BASE_URL` on
-the frontend.
+The Netlify + Netlify Functions setup below gets you this automatically
+— `netlify.toml` redirects `/api/*` to the Function, so the browser
+never sees two origins. If you split the frontend and API across two
+different hosts instead, set `CORS_ORIGINS` on the API (explicit
+allowlist — see `backend/.env.example`).
 
 ---
 
-## 3. Concrete deployment (Render, ~15 minutes)
+## 3. Recommended free path: Netlify + Neon (~15 minutes)
 
-Any of Render/Railway/Fly work the same way. Render as the example:
+Everything on one platform (Netlify) plus one free serverless Postgres
+(Neon). No card required for either at this scale.
 
-**Database**
-1. New → Postgres. Copy the *internal* connection string.
-2. Apply the schema once:
+**Database — Neon**
+1. Create a free project at neon.tech. Copy the connection string it
+   gives you (it already includes `?sslmode=require` — `backend/db.js`
+   auto-enables TLS for any non-`localhost` host, so nothing else to
+   configure).
+2. Apply the schema once, from your machine:
    ```bash
    psql "$DATABASE_URL" -f backend/schema.sql
-   psql "$DATABASE_URL" -f backend/seed.sql   # demo data, optional
+   psql "$DATABASE_URL" -f backend/seed.sql   # optional demo data
    ```
+   (No local `psql`? Neon's own SQL editor in its dashboard can run
+   both files' contents just as well.)
+
+**Site — Netlify**
+3. New site → connect this repo. Netlify reads `netlify.toml` at the
+   repo root automatically:
+   - build command `cd frontend && npm ci && npm run build`
+   - publish directory `frontend/dist`
+   - functions directory `netlify/functions`
+   - `/api/*` and `/health` redirected to the Function; everything
+     else falls back to `index.html` for the client-side router in
+     `frontend/src/App.jsx` — except `/sw.js`, `/manifest.json`, and
+     `/icons/*`, which are deliberately excluded from that fallback
+     (see the comment in `netlify.toml` for why).
+4. Site settings → Environment variables, add:
+   - `DATABASE_URL` — the Neon connection string from step 1
+   - `AUTH_SECRET` — **required.** Signs login sessions and QR
+     check-in codes. Generate a fresh one (do not reuse your local
+     dev value):
+     ```bash
+     node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+     ```
+     The API refuses to start without it, by design — a default
+     signing secret would let anyone forge any user's session.
+   - `GOOGLE_MAPS_API_KEY` — optional, for live-traffic ETAs
+5. Deploy. Netlify issues HTTPS on your `*.netlify.app` subdomain
+   automatically; add a custom domain in Site settings whenever you
+   want one (also auto-TLS via Let's Encrypt).
+
+That's the whole deploy. `netlify/functions/api.js` wraps the same
+`backend/app.js` that runs locally with `serverless-http`, using a
+single pooled connection per warm function instance
+(`backend/db.js`'s `createPool({ isServerless: true })`).
+
+**Verify it worked:**
+```bash
+curl https://<your-site>.netlify.app/health
+curl https://<your-site>.netlify.app/api/venues/00000000-0000-0000-0000-000000000001/queue
+```
+
+---
+
+## 3b. Alternative: Render (backend) + Neon (DB) — no serverless rewrite
+
+If you'd rather run the Express app exactly as-is, as a normal
+always-on process (simpler mental model, but Render's free tier spins
+down after ~15 min idle, so the next request eats a cold start):
+
+**Database** — same as §3, Neon.
 
 **API**
-3. New → Web Service, point at the repo, root directory `backend/`.
-4. Environment: `DATABASE_URL`, `NODE_ENV=production`,
-   `TRUST_PROXY=1`, and optionally `GOOGLE_MAPS_API_KEY`.
-5. Render detects the `Dockerfile` automatically. Health check
-   path: `/health`.
+1. Render → New → Web Service, point at this repo, root directory
+   `backend/`.
+2. Environment: `DATABASE_URL` (the Neon string), `NODE_ENV=production`,
+   `TRUST_PROXY=1`, optionally `GOOGLE_MAPS_API_KEY`.
+3. Render detects the `Dockerfile` automatically. Health check path:
+   `/health`.
 
 **Frontend**
-6. New → Static Site, root directory `frontend/`,
+4. Netlify (or Render Static Site) → root directory `frontend/`,
    build command `npm ci && npm run build`, publish directory `dist`.
-7. Add a rewrite so the SPA and API coexist on one origin:
-   - `/api/*` → your API service (proxy)
-   - `/*` → `/index.html` (SPA fallback, **excluding** `/sw.js`)
+5. Add a rewrite so the SPA and API coexist on one origin:
+   - `/api/*` → your Render API service (proxy)
+   - `/*` → `/index.html` (SPA fallback, **excluding** `/sw.js`,
+     `/manifest.json`, `/icons/*`)
 
 > Important: do **not** let the SPA fallback swallow `/sw.js`. If
 > requests for the service worker return `index.html`, the browser
@@ -84,7 +141,7 @@ Any of Render/Railway/Fly work the same way. Render as the example:
 > confusing MIME-type error.
 
 **Then**
-8. Add your custom domain; TLS is issued automatically.
+6. Add your custom domain; TLS is issued automatically.
 
 ---
 
@@ -145,20 +202,29 @@ these platform limits create. That was a good instinct.
 
 ## 5. Installing on a phone
 
-**Android (Chrome):** an install prompt appears automatically once the
-PWA criteria are met (HTTPS, manifest, service worker, icons — all
-already satisfied here). Also available via ⋮ → "Add to Home screen".
+**This build targets Android first** — the iOS subsection below is
+kept as reference for later, not something to act on now.
 
-**iOS (Safari):** Share → "Add to Home Screen". Note that **iOS gives
-no automatic prompt** — users will not discover this on their own. Add
-a dismissible in-app hint for iOS Safari visitors explaining the two
-taps, or most of them will never install it.
+**Android (Chrome):** Chrome fires `beforeinstallprompt` automatically
+once the PWA criteria are met (HTTPS, manifest, service worker, icons
+— all already satisfied here). `frontend/src/InstallPrompt.jsx`
+captures that event and shows QPinoy's own styled "Install" banner
+(bottom of screen, dismissible, remembers the dismissal in
+`localStorage`) instead of relying purely on Chrome's own mini-infobar
+— it calls `.prompt()` on a real user tap. Manual fallback is always
+available too, via ⋮ → "Add to Home screen".
 
-Once installed, both platforms launch it full-screen with your icon,
-using the `display: standalone` and `theme_color` already set in
-`manifest.json`.
+**iOS (Safari, reference only — not in scope right now):** Share →
+"Add to Home Screen". iOS never fires `beforeinstallprompt` at all —
+`InstallPrompt.jsx` simply renders nothing there, which is the correct
+behavior for it — and gives no automatic prompt of its own either, so
+if you do target iOS later you'd need a hand-built hint explaining the
+two taps, or most visitors will never discover it.
 
-### Other iOS caveats worth knowing
+Once installed, it launches full-screen with your icon, using the
+`display: standalone` and `theme_color` already set in `manifest.json`.
+
+### iOS caveats worth knowing if you revisit this later
 
 - Push notifications require **iOS 16.4+ and home-screen install**.
 - Cache/IndexedDB can be **evicted after roughly 7 days of non-use**,
@@ -190,30 +256,113 @@ the PWA.
 
 ## 7. Before you go live
 
-- [ ] HTTPS with a real certificate
-- [ ] `/sw.js` served as JavaScript, excluded from SPA fallback
-- [ ] `DATABASE_URL` uses SSL (`?sslmode=require` on most hosts)
-- [ ] `GOOGLE_MAPS_API_KEY` set, and **restricted** to your server IP
-      in Google Cloud Console — an unrestricted key will get scraped
-      and billed to you
-- [ ] Nightly cron hitting `POST /api/venues/:id/rebalance`
-- [ ] Automated database backups turned on
-- [ ] `npm ci --omit=dev` in the production build (the Dockerfile does this)
+- [ ] HTTPS with a real certificate (automatic on Netlify/Render)
+- [ ] `/sw.js`, `/manifest.json`, `/icons/*` excluded from the SPA
+      fallback (already set up in `netlify.toml`)
+- [ ] `DATABASE_URL` uses SSL — automatic via `backend/db.js` for any
+      non-`localhost` host, including Neon
+- [ ] `GOOGLE_MAPS_API_KEY` set, and restricted in Google Cloud
+      Console. On Render/Fly you can restrict by server IP; on Netlify
+      Functions there's no fixed outbound IP to restrict by, so
+      restrict by **API** (Distance Matrix only) and set a billing
+      quota/alert instead — an unrestricted key will get scraped and
+      billed to you either way
+- [ ] A cron hitting `POST /api/venues/:id/rebalance` nightly per
+      venue — a free option on Netlify is a
+      [Scheduled Function](https://docs.netlify.com/functions/scheduled-functions/);
+      cron-job.org hitting the endpoint directly also works on any host
+- [ ] Automated database backups turned on (Neon keeps point-in-time
+      restore on its free tier for a short window — check current
+      limits before relying on it for anything you can't afford to lose)
+- [ ] `npm ci --omit=dev` in the production build (the Dockerfile does
+      this for the Render path; Netlify's own build doesn't ship dev
+      dependencies to the Function bundle either)
 - [ ] Decide on your answer to section 4
 
-### Not yet built — you will need these
+### Authentication — built
 
-This codebase has no **authentication or rate limiting.** As shipped,
-anyone who knows a venue UUID can call the next customer or drop
-someone from the line. Before real venues touch it:
+Accounts, roles, and per-venue authorization are now in place:
 
-- Attendant auth on every mutating endpoint (`/serve`, `/reinstate`,
-  `/move`, `/automation`)
-- A customer-scoped token so people can only update *their own*
-  location
-- Rate limiting on `/location`, which is the endpoint an attacker
-  would hammer
+- Every queue endpoint (`/queue`, `/serve`, `/reinstate`, `/move`,
+  `/automation`, `/rebalance`) requires a signed-in user who holds a
+  `venue_members` row for that venue. A signed-in stranger gets a
+  404, not a 403 — confirming a venue exists would let anyone
+  enumerate venue IDs.
+- `/location` is customer-scoped: a customer may update only the
+  ticket linked to their own `user_id`; venue staff may update any
+  ticket at their own venue; everyone else gets a 403.
+- Roles are `owner` → `manager` → `attendant`. Owners and managers
+  edit the staff list; attendants run the line only. The owner row
+  cannot be demoted or removed through the staff endpoints.
 
-The layered architecture makes this a contained change — auth is
-middleware in `routes.js`, and none of the queue logic in
-`queueCore.js` has to know about it.
+### Rate limiting — built
+
+Counters live in Postgres (`rate_limits`), **not in process memory**.
+On Netlify Functions each request may land on a different or
+cold-started container, so an in-memory counter resets constantly and
+is bypassed by simply spreading requests — a counter is only a limit
+if every instance can see it. The cost is one extra query on limited
+requests, which both endpoints were already making anyway.
+
+| Endpoint | Limit | Keyed on |
+|---|---|---|
+| `POST /auth/login` | 10 **failed** attempts / 15 min | (email, IP) pair |
+| `POST /auth/login` | 60 **failed** attempts / 15 min | IP, across all accounts |
+| `PATCH …/location` | 30 requests / min | user id |
+
+Three decisions worth knowing about:
+
+- **Only failed logins count, and the account counter includes the
+  IP.** Keying it on the email alone is the obvious implementation and
+  it is a self-inflicted denial of service: anyone could burn a
+  stranger's budget with ten wrong guesses and lock that person out of
+  their own account. (Note that "a success clears the counter" does
+  *not* fix this on its own — the limit is checked before the password
+  is verified, so the victim never gets that far.) NIST SP 800-63B
+  makes the same recommendation: throttle, don't lock accounts.
+- **A successful login does not refill the broad per-IP counter.** If
+  it did, an attacker who owns any valid account would have a free
+  reset button between spraying rounds.
+- **The limiter fails open.** If the counter query itself errors,
+  requests are allowed rather than refused — a database blip must not
+  lock every user out of the product. This widens no real window,
+  since neither endpoint can do anything useful without that same
+  database.
+
+Old windows are swept opportunistically on ~1% of requests, so the
+table stays proportional to live traffic with no cron to schedule.
+
+**Upgrading a database that already exists:** the `rate_limits` block
+in `schema.sql` uses `IF NOT EXISTS`, so you can paste just that part
+into an already-deployed database instead of re-running the whole
+schema:
+
+```sql
+CREATE TABLE IF NOT EXISTS rate_limits (
+    bucket        TEXT PRIMARY KEY,
+    window_start  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    hits          INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_rate_limits_window_start ON rate_limits (window_start);
+```
+
+Until that table exists the limiter fails open, so an out-of-date
+database degrades to "no throttling" rather than to an outage — but
+it also means you get no protection, so run it.
+
+**Known gap, stated plainly:** an attacker with many source IPs can
+still grind a single account, because each IP gets its own per-account
+budget. Closing that needs a CAPTCHA or step-up challenge after
+repeated failures. Worth adding when there is something worth
+stealing; it is not there today.
+
+### Still not built — you will want these
+
+- **Password reset / email verification.** There is no way for a user
+  to recover a forgotten password, and nothing proves an email
+  address belongs to the person who typed it. Both need an email
+  provider (Resend and Postmark both have usable free tiers).
+- **Session revocation.** Tokens are stateless and valid for 30 days;
+  there is no server-side "log out everywhere". Rotating
+  `AUTH_SECRET` invalidates every session at once, which is the blunt
+  version of this.

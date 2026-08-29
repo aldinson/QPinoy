@@ -10,16 +10,15 @@
     <style>html, body { background: #12141C; margin: 0; }</style>
   </head>
   <body>
+    <!--
+      No manual serviceWorker.register() here — vite-plugin-pwa
+      (injectRegister: 'auto') already injects registerSW.js into the
+      build output, which does exactly that. A second hand-written
+      registration of the same /sw.js was redundant (harmless, since
+      register() is idempotent, but two log lines and two code paths
+      for one job is one too many).
+    -->
     <div id="root"></div>
     <script type="module" src="/src/main.jsx"></script>
-    <script>
-      if ('serviceWorker' in navigator) {
-        window.addEventListener('load', () => {
-          navigator.serviceWorker.register('/sw.js').catch((err) =>
-            console.error('Service worker registration failed:', err)
-          );
-        });
-      }
-    </script>
   </body>
 </html>

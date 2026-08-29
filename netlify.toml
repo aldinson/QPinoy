@@ -1,0 +1,47 @@
+[build]
+  base = "."
+  command = "cd frontend && npm ci && npm run build"
+  publish = "frontend/dist"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+# Frontend calls relative /api/* paths (see frontend/src/api.js). This
+# redirect sends every one of them to the single Function that wraps
+# the real Express app (netlify/functions/api.js -> backend/app.js),
+# so the browser never sees a separate origin — no CORS needed. The
+# function itself normalizes whatever path shape Netlify hands it
+# back to a clean /api/... path (see the comment in that file).
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api"
+  status = 200
+
+[[redirects]]
+  from = "/health"
+  to = "/.netlify/functions/api"
+  status = 200
+
+# SPA fallback for client-side routes (/attendant, /join, /demo — see
+# frontend/src/App.jsx's router). This rule doesn't set force = true,
+# so Netlify serves a real file at the request path (sw.js,
+# manifest.json, icons/*, offline.html) instead of falling through to
+# index.html whenever one exists — which matters here: if any of those
+# fell through, the browser would get HTML where it expects JS/JSON/an
+# image, and the service worker would fail to register with a
+# confusing MIME-type error (see DEPLOYMENT.md).
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    # Never let a CDN/browser cache the service worker script itself —
+    # that's how a fixed bug in it stays live on returning phones for
+    # days. The precached app-shell assets underneath it are still
+    # content-hashed and cache fine; only this one file needs to always
+    # be re-checked.
+    Cache-Control = "no-cache"

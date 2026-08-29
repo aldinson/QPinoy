@@ -5,7 +5,7 @@ salons). The core idea: a customer's place in line depends on both **whether
 they're physically present** and **how much they've committed financially** —
 so the line self-corrects around no-shows without punishing everyone equally.
 
-**69 automated tests. No placeholder code.** Every layer — the pure algorithm,
+**136 automated tests. No placeholder code.** Every layer — the pure algorithm,
 the SQL transactions, the HTTP endpoints, the service worker — is tested
 against real infrastructure, not mocks.
 
@@ -35,39 +35,128 @@ platform constraint that affects this app's core design.
 backend/                       Node/Express API + Postgres
   queueCore.js                  Pure ordering algorithm — zero imports, fully unit-tested
   queueEngine.js                Transaction layer: row locks + persistence
-  routes.js                     Express REST endpoints
-  server.js                     Entry point, CORS allowlist, graceful shutdown
+  routes.js                     Express REST endpoints for the queue (all staff-gated)
+  authRoutes.js                 Register, login, /me, enrollment token, my-place-in-line
+  venueRoutes.js                Venue creation + the staff roster
+  auth.js                       Middleware: requireAuth, requireVenueRole
+  password.js                   scrypt hashing (node:crypto, no native dep)
+  tokens.js                     Signed session + QR enrollment tokens
+  rateLimit.js                  Postgres-backed throttling (login, location)
+  app.js                        The Express app itself — no listen(), no process lifecycle
+  db.js                         Shared pg Pool factory (SSL auto-detect, serverless-aware sizing)
+  server.js                     Process bootstrap for Docker/Render/local dev: app.js + db.js + listen()
   geofence.js                   Haversine presence math (server-authoritative)
   distanceMatrixClient.js       Swappable ETA adapter (Google, or offline fallback)
   schema.sql                    DDL, enums, partial indexes
   seed.sql                      Demo data (full reset, idempotent)
   smoke.js                      Scripted end-to-end walkthrough
+  seedAccounts.js               Demo logins, one per role (hashing can't live in .sql)
   Dockerfile                    Multi-stage production build
-  *.test.js                     64 tests (43 unit, 21 integration)
+  .env.example                  Copy to .env for local dev
+  *.test.js                     136 tests (73 unit, 63 integration)
+
+netlify/functions/api.js       Wraps backend/app.js with serverless-http for Netlify deploys
 
 frontend/                      Vite + React + Tailwind PWA
-  src/QueueSimulator.jsx        Interactive simulator — mirrors the real algorithm
+  src/App.jsx                   Auth-aware router shell; picks a home screen per role
+  src/auth.jsx                  AuthProvider — session state, revalidated on every boot
+  src/AuthScreens.jsx           Sign in / register
+  src/VenueSetup.jsx            First-run venue creation for a business account
+  src/AttendantDashboard.jsx    Staff console — scan customers, call next, reinstate, move
+  src/QrScanner.jsx             Camera QR reader (BarcodeDetector, jsQR fallback, manual entry)
+  src/StaffMembers.jsx          The staff roster: authorize and revoke
+  src/CustomerHome.jsx          The customer's rotating check-in QR + their place in line
+  src/InstallPrompt.jsx         Android install banner (captures beforeinstallprompt)
+  src/api.js                    Fetch client for the backend (attaches the Bearer token)
+  src/QueueSimulator.jsx        In-memory algorithm demo — mirrors the real algorithm, no backend needed
   src/sw.js                     Service worker (build-time precache injection)
   public/                       manifest.json, offline.html, icons
   test/                         5 service worker install tests
 
-docker-compose.yml             Postgres for local dev
+netlify.toml                   Netlify build, redirects (SPA + /api/*), and headers
+docker-compose.yml              Postgres for local dev
 .github/workflows/ci.yml       CI: tests against a real Postgres, plus frontend build
 LOCAL_SETUP.md                 Tech stack + setup, both Docker and native
-DEPLOYMENT.md                  Hosting, HTTPS, installing on phones
+DEPLOYMENT.md                  Hosting (Netlify+Neon, or Render+Neon), HTTPS, installing on Android
 ```
 
 ## Try it live
 
-`frontend/src/QueueSimulator.jsx` is a real, running mirror of the backend
-algorithm — not a mockup. Six customers are seeded exactly like `seed.sql`.
-Charlie Nguyen (flask icon) is the test ticket: toggle her GPS and payment
-status, then tap **Call next customer**. Watch the activity log — it names
-exactly who the engine evaluated and why. Keep tapping "Call next" without
-touching anything and you'll also see Dana (seeded not-checked-in) get
-automatically stepped back by the engine on her own, since the trigger
-re-evaluates whoever is two slots behind *whoever's currently serving*, not
-just the one customer you're prodding.
+`npm run db:setup` seeds four demo logins against the demo venue, one
+per role, all with the password `demo-password-123`:
+
+| Login | What you'll see |
+|---|---|
+| `owner@qpinoy.demo` | Staff console + the staff roster |
+| `manager@qpinoy.demo` | Same — managers can also edit staff |
+| `attendant@qpinoy.demo` | Staff console, **no** Staff button |
+| `customer@qpinoy.demo` | A rotating check-in QR and their place in line |
+
+The fastest way to see the whole loop: open the customer login on your
+phone and the owner login on your laptop, hit **Scan customer**, and
+point the laptop's webcam at the phone. (No camera? The scanner has an
+"Enter manually" fallback that takes the same code as text.)
+
+The app routes you by role automatically:
+
+- **Staff** land on the live console: the real queue from Postgres,
+  with call-next / reinstate / move / rebalance, plus **Scan customer**
+  and a walk-in form for people without the app.
+- **Customers** land on their check-in QR and their live position, with
+  a "Share my location" button that geofences them in server-side (see
+  [DEPLOYMENT.md §4](DEPLOYMENT.md) for the platform limits this works
+  within).
+- **`/demo`** — reachable signed-out — is
+  `frontend/src/QueueSimulator.jsx`, a real, running mirror
+  of the backend algorithm with no backend required — not a mockup, just
+  in-memory. Six customers are seeded exactly like `seed.sql`. Charlie
+  Nguyen (flask icon) is the test ticket: toggle her GPS and payment
+  status, then tap **Call next customer**. Watch the activity log — it
+  names exactly who the engine evaluated and why. Keep tapping "Call
+  next" without touching anything and you'll also see Dana (seeded
+  not-checked-in) get automatically stepped back by the engine on her
+  own, since the trigger re-evaluates whoever is two slots behind
+  *whoever's currently serving*, not just the one customer you're
+  prodding.
+
+## Accounts and roles
+
+Two kinds of people use QPinoy, and they meet at a QR code.
+
+**Customers register themselves** — but signing up does not put anyone
+in a line. To join a venue's queue, the customer opens the app and
+shows their **check-in QR code**; a staff member scans it with their
+own phone. That scan is the enrollment. It means a venue's line only
+ever contains people who physically turned up and consented, and it
+means the customer never has to type anything.
+
+**Businesses register, then create a venue**, which makes them its
+owner. Owners delegate with two roles:
+
+| Role | Run the line | Enroll customers | Edit the staff list |
+|---|:---:|:---:|:---:|
+| **owner** | ✅ | ✅ | ✅ |
+| **manager** | ✅ | ✅ | ✅ |
+| **attendant** | ✅ | ✅ | ✕ |
+
+Permissions come **only** from a user's `venue_members` row for that
+venue — never from their account type. One account can be a customer
+at the barber downstairs and an attendant at their own shop.
+
+### Why the QR code is a signed token, not a user ID
+
+`GET /me/enrollment-token` returns a **90-second signed token** that
+the phone renders as a QR code and silently re-issues before it
+expires. A static identifier would be a permanent credential
+displayed on a screen in a public waiting room — photograph it once,
+reuse it forever. The customer's identity is read from the token's
+signature, so a scan cannot be redirected at someone else by editing
+the request body (there's a test that tries exactly that).
+
+The same token module signs login sessions, with one hard rule: every
+token declares its purpose, and verification requires the caller to
+state which purpose it expects. A QR code can therefore never be
+replayed as a login session.
 
 ## The algorithm
 
@@ -159,7 +248,7 @@ without touching anything else in the system.
   an early version of `onCustomerStartedServing` was caught assuming its
   caller had already flipped the row's status in a separate transaction (a
   real race-condition window). It's now one atomic `callNextCustomer` call.
-- **16 HTTP-layer tests** (`routes.integration.test.js`) boot a real Express
+- **21 HTTP-layer tests** (`routes.integration.test.js`) boot a real Express
   app on an ephemeral port and hit every endpoint with real requests —
   success paths, 400s on bad input (invalid `direction`, non-boolean
   `enabled`, an out-of-range or non-numeric `lat`), and 404s on a
@@ -169,6 +258,60 @@ without touching anything else in the system.
   malformed value could silently corrupt the geofence math. `lat`/`lng` are
   now the only inputs accepted, and both `geofence.js` (the check itself)
   and `routes.js` (input validation) got fixed together.
+- **21 unit tests** for the auth primitives (`password.test.js`,
+  `tokens.test.js`) — and these are the ones worth reading, because
+  hand-rolled auth is exactly where "looks fine" isn't good enough.
+  They assert the attacks *fail*: an `alg: none` header is rejected
+  (the algorithm is never read from the token, so the canonical JWT
+  bypass has nothing to grab); a tampered payload fails the signature;
+  a token signed with a different secret is refused; an enrollment QR
+  cannot be replayed as a login session, nor a session scanned as a QR;
+  a token with no `exp` is treated as expired rather than eternal; and
+  a missing or short `AUTH_SECRET` throws at startup instead of
+  silently falling back to a default. On the password side: identical
+  passwords produce different hashes (per-row salt), a hash written
+  with *older, cheaper* scrypt parameters still verifies (which is why
+  the parameters are stored in the hash string rather than a constant),
+  and a corrupt stored hash reads as "wrong password" instead of a 500.
+- **23 integration tests** (`auth.integration.test.js`) drive the whole
+  account model over real HTTP against a real database — registration,
+  login, delegation, the QR scan — and pin the authorization boundaries
+  that are the entire point of having accounts: anonymous callers are
+  refused; a signed-in stranger gets a **404** rather than a 403 on a
+  venue they don't staff (a 403 would confirm the venue exists and turn
+  the endpoint into an ID enumerator); an attendant cannot edit the
+  staff list but a manager can; the owner row cannot be demoted or
+  deleted; revoking access takes effect on the very next request; a
+  wrong password and an unknown account return byte-identical replies
+  so the endpoint can't be used to discover who has signed up; and a
+  customer cannot push location into a stranger's ticket.
+- **22 tests for rate limiting** (`rateLimit.test.js`,
+  `rateLimit.integration.test.js`), and one of them found a real flaw
+  in the first draft. The limiter originally keyed the login counter on
+  the email address alone — which meant ten wrong guesses would lock
+  the *real owner* out of their own account, from their own phone. The
+  test asserting "a blocked attacker cannot lock the real user out"
+  failed, and the fix was to key on the **(email, IP) pair** instead.
+  Worth stressing why the obvious mitigation doesn't work: "only
+  failures count and a success clears the counter" reads like it
+  solves this, but the limit is checked *before* the password is
+  verified, so the victim never reaches the clearing step. The
+  remaining tests pin down the rest: concurrent `record()` calls never
+  lose an increment (the increment is one statement precisely so
+  parallel requests can't both read N and both write N+1); windows
+  roll over; a successful login does **not** refill the broad per-IP
+  spraying budget (or an attacker with one valid account would have a
+  free reset button); failures against unknown addresses are counted
+  too (otherwise the presence of throttling would itself reveal which
+  emails are registered); and bucket keys hash the identifier so this
+  table never becomes a second home for emails and IPs.
+- A second real bug in `/location`, caught the same way: its final `UPDATE`
+  scoped the write by `entryId` alone, not by `venue_id`. An `entryId` that
+  actually belonged to a *different* venue would still match and get
+  silently overwritten with the wrong venue's geofence result, and a
+  nonexistent `entryId` returned a fabricated `200` instead of `404`. Fixed
+  by scoping the `UPDATE` with `AND venue_id = $6` and checking `rowCount`;
+  two new tests (cross-venue write, nonexistent entry) pin this down.
 - `schema.sql` was executed end-to-end against Postgres 16 with zero errors.
 - The indexes weren't just declared and trusted — they were load-tested. A
   venue was seeded with 60,000 historical `served` rows plus a handful of
@@ -211,9 +354,26 @@ createdb qpinoy          # then: psql qpinoy -f schema.sql
 DATABASE_URL=postgres://localhost/qpinoy npm start
 ```
 
+All `/api/venues/*` endpoints below require a `Bearer` session token
+whose user holds a role at that venue. See "Accounts and roles" above.
+
 | Endpoint | Effect |
 |---|---|
+| `POST /api/auth/register` | Self-service signup (`{ email, password, fullName, phone?, accountType? }`) |
+| `POST /api/auth/login` | Returns a 30-day session token |
+| `GET /api/auth/me` | Current user + every venue they staff |
+| `GET /api/me/enrollment-token` | Short-lived token the customer's phone renders as a QR code |
+| `GET /api/me/queue` | The customer's own live tickets, with position computed server-side |
+| `POST /api/venues` | Create a venue; creator becomes its owner |
+| `GET /api/venues/mine` | Venues the signed-in user staffs |
+| `GET`/`POST` `/api/venues/:id/members` | Staff roster / authorize someone (owner + manager only) |
+| `DELETE /api/venues/:id/members/:userId` | Revoke staff access (owner + manager only) |
+
+| Queue endpoint | Effect |
+|---|---|
 | `GET /api/venues/:id/queue` | Live line, in serve order |
+| `POST /api/venues/:id/queue/enroll` | **Scan a customer in** (`{ enrollmentToken, paymentTier? }`) — the primary way people join |
+| `POST /api/venues/:id/queue` | Add a walk-in with no account, by name (`{ customerName, customerPhone?, paymentTier? }`) |
 | `POST /api/venues/:id/queue/:entryId/serve` | Call next customer (atomic: completes prior, promotes this one, runs the trigger) |
 | `POST /api/venues/:id/queue/:entryId/reinstate` | Lock-Back override |
 | `POST /api/venues/:id/queue/:entryId/move` | Manual one-slot nudge (`{ "direction": "up" \| "down" }`) |

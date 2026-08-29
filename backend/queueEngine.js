@@ -109,6 +109,69 @@ async function callNextCustomer(db, venueId, entryId) {
 }
 
 /**
+ * Customer joins the line. Locked under the same active-queue FOR
+ * UPDATE as every other mutation here, so a join racing a concurrent
+ * join (or a rebalance) can't compute a stale MAX(order_weight) and
+ * collide on the same slot. expected_slot_at is a rough estimate —
+ * "however many people are ahead of you, times the venue's average
+ * service time" — good enough to seed isAtRisk() until real ETA pings
+ * start arriving; it is never treated as a promise elsewhere in the
+ * system.
+ */
+async function joinQueue(db, venueId, { customerName, customerPhone, paymentTier, userId = null }) {
+  const client = await db.connect();
+  try {
+    await client.query('BEGIN');
+
+    const venueRes = await client.query(`SELECT avg_service_minutes FROM venues WHERE id = $1 FOR SHARE`, [venueId]);
+    if (!venueRes.rows[0]) {
+      await client.query('ROLLBACK');
+      return { mutated: false, reason: 'venue_not_found' };
+    }
+    const avgServiceMinutes = venueRes.rows[0].avg_service_minutes;
+
+    const { rows: active } = await client.query(
+      `SELECT order_weight FROM queue_entries
+        WHERE venue_id = $1 AND status = ANY($2::queue_status[])
+        FOR UPDATE`,
+      [venueId, ACTIVE_STATUSES]
+    );
+
+    const newWeight = active.length ? Math.max(...active.map((r) => r.order_weight)) + GAP : GAP;
+    const expectedSlotMinutes = active.length * avgServiceMinutes;
+
+    let rows;
+    try {
+      ({ rows } = await client.query(
+        `INSERT INTO queue_entries (venue_id, user_id, customer_name, customer_phone, payment_tier, order_weight, expected_slot_at)
+         VALUES ($1, $2, $3, $4, $5, $6, now() + $7 * interval '1 minute')
+         RETURNING *`,
+        [venueId, userId, customerName, customerPhone ?? null, paymentTier, newWeight, expectedSlotMinutes]
+      ));
+    } catch (err) {
+      // 23505 on idx_one_active_entry_per_user_per_venue: this
+      // registered customer already holds a live ticket here. Two
+      // staff phones scanning the same QR at the same moment both
+      // reach this line; the database picks a winner and the loser
+      // gets a clean "already in line" instead of a 500.
+      if (err.code === '23505') {
+        await client.query('ROLLBACK');
+        return { mutated: false, reason: 'already_in_queue' };
+      }
+      throw err;
+    }
+
+    await client.query('COMMIT');
+    return { mutated: true, reason: 'joined', entry: rows[0] };
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
  * Attendant "Lock-Back" override — rescue a customer whose GPS
  * likely misfired (e.g. indoor degradation inside a mall). Places
  * them between the currently-serving customer and next-in-line, and
@@ -219,6 +282,7 @@ async function rebalanceIfNeeded(db, venueId) {
 
 module.exports = {
   getLiveQueue,
+  joinQueue,
   callNextCustomer,
   reinstateSlot,
   moveOneSlot,

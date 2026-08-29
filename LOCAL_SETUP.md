@@ -57,7 +57,7 @@ qpinoy/
 │   ├── schema.sql             DDL + indexes
 │   ├── seed.sql               Demo data (full reset, idempotent)
 │   ├── smoke.js               End-to-end scripted walkthrough
-│   └── *.test.js              64 tests
+│   └── *.test.js              136 tests
 ├── frontend/                  Vite + React + Tailwind app
 │   ├── src/QueueSimulator.jsx  The interactive simulator
 │   ├── src/sw.js               Service worker (precache injected at build time)
@@ -80,7 +80,11 @@ docker compose up -d
 cd backend
 cp .env.example .env
 #   set: DATABASE_URL=postgres://qpinoy:qpinoy@localhost:5433/qpinoy
+#   set: AUTH_SECRET=<32+ chars>   <-- REQUIRED, the API won't boot without it
+#        generate one with:
+#        node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 npm install
+npm run db:seed:accounts       # demo logins, one per role (needs the schema seeded)
 npm run dev                    # http://localhost:4000
 
 # 3. Frontend (separate terminal)
@@ -92,6 +96,20 @@ npm run dev                    # http://localhost:5173
 Note the port: Compose maps Postgres to **5433**, not 5432, so it won't
 collide with a Postgres you may already have running locally.
 
+### Demo logins
+
+`npm run db:seed:accounts` creates one account per role against the
+demo venue. All four use the password **`demo-password-123`**:
+
+| Email | Role |
+|---|---|
+| `owner@qpinoy.demo` | owner — full control, incl. the staff roster |
+| `manager@qpinoy.demo` | manager — can also edit the staff roster |
+| `attendant@qpinoy.demo` | attendant — runs the line, cannot edit staff |
+| `customer@qpinoy.demo` | customer — gets a check-in QR, no venue powers |
+
+Re-running the script is safe; it resets exactly these four accounts.
+
 ---
 
 ## 4. Setup — Path B: Native Postgres
@@ -102,8 +120,9 @@ createdb qpinoy
 cd backend
 cp .env.example .env
 #   set: DATABASE_URL=postgres://localhost:5432/qpinoy
+#   set: AUTH_SECRET=<32+ chars>  (see Path A above)
 npm install
-npm run db:setup               # applies schema.sql, then seed.sql
+npm run db:setup               # schema.sql, then seed.sql, then demo accounts
 npm run dev
 
 cd ../frontend && npm install && npm run dev
@@ -116,9 +135,9 @@ cd ../frontend && npm install && npm run dev
 ```bash
 cd backend
 
-npm test                       # all 64 tests
-npm run test:unit              # 43 tests, no database needed
-npm run test:integration       # 21 tests, needs DATABASE_URL
+npm test                       # all 136 tests
+npm run test:unit              # 73 tests, no database needed
+npm run test:integration       # 63 tests, needs DATABASE_URL
 npm run smoke                  # scripted end-to-end walkthrough
 ```
 
@@ -130,7 +149,7 @@ fastest way to confirm the whole stack is wired up correctly.
 A few things worth knowing about the test suite:
 
 - **The unit tests need no database.** Run `npm run test:unit` anywhere.
-  The full `npm test` self-skips the 21 DB-dependent tests if
+  The full `npm test` self-skips the 63 DB-dependent tests if
   `DATABASE_URL` is unset rather than failing.
 - **Tests seed and clean up their own fixtures.** You can run the suite
   repeatedly with no manual reset. It was verified green across three
@@ -148,29 +167,57 @@ client-side — no backend needed to explore it. Charlie (flask icon) is
 the test ticket: toggle her GPS/payment state, then hit **Call next
 customer**.
 
-To exercise the actual backend instead:
+To exercise the actual backend instead. Every venue endpoint is
+staff-gated now, so the first step is getting a token:
 
 ```bash
 VENUE=00000000-0000-0000-0000-000000000001
 ALICE=10000000-0000-0000-0000-000000000001
 DANA=10000000-0000-0000-0000-000000000004
 
+# Sign in as the seeded owner and keep the token
+TOKEN=$(curl -s -X POST localhost:4000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"owner@qpinoy.demo","password":"demo-password-123"}' | jq -r .token)
+
+AUTH="Authorization: Bearer $TOKEN"
+
 # See the line
-curl -s localhost:4000/api/venues/$VENUE/queue | jq '.queue[] | {customer_name, status, order_weight}'
+curl -s -H "$AUTH" localhost:4000/api/venues/$VENUE/queue \
+  | jq '.queue[] | {customer_name, status, order_weight}'
 
 # Call the next customer (fires the two-slot-prior trigger)
-curl -s -X POST localhost:4000/api/venues/$VENUE/queue/$ALICE/serve
+curl -s -X POST -H "$AUTH" localhost:4000/api/venues/$VENUE/queue/$ALICE/serve
+
+# Scan a customer in. Get the code from the customer's own session:
+CUST=$(curl -s -X POST localhost:4000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"customer@qpinoy.demo","password":"demo-password-123"}' | jq -r .token)
+QR=$(curl -s -H "Authorization: Bearer $CUST" \
+  localhost:4000/api/me/enrollment-token | jq -r .enrollmentToken)
+
+curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d "{\"enrollmentToken\":\"$QR\"}" \
+  localhost:4000/api/venues/$VENUE/queue/enroll
 
 # Send a location ping. Note you send ONLY lat/lng — the server decides
 # whether that counts as checked in. Sending isCheckedIn:true is ignored.
-curl -s -X PATCH localhost:4000/api/venues/$VENUE/queue/$DANA/location \
+curl -s -X PATCH -H "$AUTH" localhost:4000/api/venues/$VENUE/queue/$DANA/location \
   -H 'Content-Type: application/json' -d '{"lat":40.7128,"lng":-74.0060}'
 
 # Lock-Back override
-curl -s -X POST localhost:4000/api/venues/$VENUE/queue/$DANA/reinstate
+curl -s -X POST -H "$AUTH" localhost:4000/api/venues/$VENUE/queue/$DANA/reinstate
 
 # Reset the demo line at any time
-npm run db:seed
+npm run db:seed && npm run db:seed:accounts
+```
+
+Rate limits apply here too: ten wrong passwords from one machine and
+you'll start getting `429` for fifteen minutes. Clear them during
+development with:
+
+```bash
+psql "$DATABASE_URL" -c "DELETE FROM rate_limits;"
 ```
 
 ---
@@ -208,7 +255,7 @@ under-estimate arrival times.
 |---|---|
 | `Cannot find module 'pg'` | `npm install` wasn't run in `backend/`. |
 | `role "qpinoy" does not exist` | Native Postgres path — create the role, or use the Docker path. |
-| 21 tests skip | `DATABASE_URL` isn't set. Expected; unit tests still run. |
+| 63 tests skip | `DATABASE_URL` isn't set. Expected; unit tests still run. |
 | Schema didn't apply under Docker | Init scripts only run on **first** volume creation. `docker compose down -v` then `up -d`. |
 | `duplicate key ... idx_one_serving_per_venue` | Working as designed — the DB enforces one serving customer per venue. Complete the current one first. |
 | Port 5432 in use | Compose already uses 5433 to avoid this; make sure `DATABASE_URL` points at 5433. |
