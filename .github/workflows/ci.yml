@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: qpinoy
+          POSTGRES_PASSWORD: qpinoy
+          POSTGRES_DB: qpinoy
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U qpinoy -d qpinoy"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://qpinoy:qpinoy@localhost:5432/qpinoy
+      # CI-only value. The test suites fall back to their own secret if
+      # this is unset, but setting it explicitly means the smoke test
+      # and any future script that needs one also work here.
+      AUTH_SECRET: ci-only-secret-not-used-anywhere-else-0123456789
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+        working-directory: backend
+      - run: npm run db:setup
+        working-directory: backend
+      - run: npm test
+        working-directory: backend
+      # The smoke test drives the real app over HTTP end to end
+      # (register → create venue → scan a QR → run the line), so it
+      # catches wiring breaks that unit and route tests can miss.
+      - run: npm run smoke
+        working-directory: backend
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm test
+        working-directory: frontend
+      - run: npm run build
+        working-directory: frontend
