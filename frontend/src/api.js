@@ -1,11 +1,17 @@
 /**
  * api.js — thin fetch wrapper over the real backend.
  * ─────────────────────────────────────────────────────────────
- * Always calls relative /api/* paths, never an absolute host: the
- * Vite dev proxy forwards those to localhost:4000 in development
- * (vite.config.js), and netlify.toml redirects them to the Function
- * in production. Same code, same requests, both environments.
+ * By default calls relative /api/* paths: the Vite dev proxy
+ * forwards those to localhost:4000 in development (vite.config.js),
+ * and netlify.toml redirects them to the Function in production.
+ *
+ * When VITE_API_BASE is set at build time (used by the Capacitor
+ * Android wrapper, which has no dev proxy and no Netlify redirect),
+ * requests go to `${VITE_API_BASE}/api/*` instead — an absolute
+ * host such as http://192.168.254.120:4000.
  */
+
+const API_BASE = (import.meta.env.VITE_API_BASE ?? '').replace(/\/$/, '');
 
 const TOKEN_STORAGE_KEY = 'qpinoy_token';
 
@@ -60,7 +66,7 @@ async function request(method, path, body) {
   const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
 
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(`${API_BASE}/api${path}`, {
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,

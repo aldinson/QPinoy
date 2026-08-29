@@ -10,6 +10,8 @@
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
+    "@capacitor/android": "^6.2.1",
+    "@capacitor/core": "^6.2.1",
     "jsqr": "^1.4.0",
     "lucide-react": "^0.383.0",
     "qrcode": "^1.5.4",
@@ -17,6 +19,7 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@capacitor/cli": "^6.2.1",
     "@vitejs/plugin-react": "^4.3.1",
     "autoprefixer": "^10.4.19",
     "postcss": "^8.4.38",
