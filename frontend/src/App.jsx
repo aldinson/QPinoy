@@ -4,6 +4,7 @@ import { COLORS, FONT_MONO, FONT_SANS } from './theme';
 import { AuthProvider, useAuth } from './auth';
 import { LoginScreen, RegisterScreen } from './AuthScreens';
 import CustomerHome from './CustomerHome';
+import JoinVenue from './JoinVenue';
 import VenueSetup from './VenueSetup';
 import AttendantDashboard from './AttendantDashboard';
 import StaffMembers from './StaffMembers';
@@ -145,6 +146,16 @@ function Routes() {
   if (loc.path === '/demo') return <QueueSimulator />;
 
   if (loading) return <Loading />;
+
+  // Reachable both signed-in and signed-out, like /demo: a "join our
+  // line" link/QR has to work for a visitor who has never opened the app
+  // before. JoinVenue itself handles the signed-out case (sign in/
+  // register, then come back here).
+  if (loc.path === '/join') {
+    const venueId = params.get('venue');
+    if (!venueId) return <Welcome navigate={navigate} />;
+    return <JoinVenue venueId={venueId} navigate={navigate} />;
+  }
 
   if (!user) {
     if (loc.path === '/register') return <RegisterScreen navigate={navigate} />;

@@ -27,7 +27,7 @@ if (!process.env.DATABASE_URL) {
   test('skipped: DATABASE_URL not set', { skip: true }, () => {});
 } else {
   const { Pool } = require('pg');
-  const { getLiveQueue, callNextCustomer, reinstateSlot, moveOneSlot } = require('./queueEngine');
+  const { getLiveQueue, callNextCustomer, reinstateSlot, moveOneSlot, markNoShow } = require('./queueEngine');
 
   const pool = new Pool({ connectionString: process.env.DATABASE_URL });
   const VENUE_ID = '00000000-0000-0000-0000-000000000097'; // deliberately NOT the demo seed's venue — running tests must not wipe local demo data
@@ -119,6 +119,29 @@ if (!process.env.DATABASE_URL) {
     const fionaIdxAfter = namesAfter.indexOf('Fiona Alvarez');
     const fionaIdxBefore = before.map((r) => r.customer_name).indexOf('Fiona Alvarez');
     assert.ok(fionaIdxAfter < fionaIdxBefore);
+  });
+
+  test('marking a WAITING customer a no-show is refused — only the serving slot can be', async () => {
+    const result = await markNoShow(pool, VENUE_ID, CUSTOMER.charlie); // Charlie is still 'waiting' at this point
+    assert.equal(result.mutated, false);
+    assert.equal(result.reason, 'not_currently_serving');
+  });
+
+  test('marking Bob (currently serving) a no-show removes him from the active line without touching anyone else', async () => {
+    const before = await getLiveQueue(pool, VENUE_ID);
+    assert.equal(before[0].customer_name, 'Bob Martinez');
+    assert.equal(before[0].status, 'serving');
+
+    const result = await markNoShow(pool, VENUE_ID, CUSTOMER.bob);
+    assert.equal(result.mutated, true);
+    assert.equal(result.reason, 'no_show');
+
+    const { rows } = await pool.query(`SELECT status FROM queue_entries WHERE id = $1`, [CUSTOMER.bob]);
+    assert.equal(rows[0].status, 'no_show'); // NOT 'served' — this is the bug being fixed
+
+    const after = await getLiveQueue(pool, VENUE_ID);
+    assert.ok(!after.some((r) => r.customer_name === 'Bob Martinez'));
+    assert.equal(after.some((r) => r.status === 'serving'), false); // slot is empty until the next `serve` call
   });
 
   test.after(async () => {

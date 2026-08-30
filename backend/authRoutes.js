@@ -12,7 +12,8 @@ const express = require('express');
 const { hashPassword, verifyPassword, describePasswordProblem } = require('./password');
 const { normalisePhone, describePhoneProblem } = require('./phone');
 const { createSessionToken, createEnrollmentToken, ENROLLMENT_TTL_SECONDS } = require('./tokens');
-const { requireAuth } = require('./auth');
+const { requireAuth, isUuid } = require('./auth');
+const { isConfigured: isPushConfigured } = require('./push');
 const { LIMITS, bucketKey, clientIp, peek, record, reset, maybePurge, tooManyRequests } = require('./rateLimit');
 
 // Deliberately permissive: one @, no whitespace, a dot in the domain.
@@ -199,15 +200,41 @@ function buildAuthRouter(pool) {
    * This is a short-lived signed token, not the user's ID. A static
    * identifier printed on a screen in a waiting room can be
    * photographed once and reused indefinitely by anyone; this expires
-   * in 90 seconds and the customer's screen quietly re-fetches a new
-   * one before then. `expiresInSeconds` is returned so the client can
-   * schedule that refresh from the server's clock rather than
+   * after a bounded window and the customer's screen quietly re-fetches
+   * a new one before then. `expiresInSeconds` is returned so the client
+   * can schedule that refresh from the server's clock rather than
    * hardcoding a number that could drift out of sync with this file.
+   *
+   * Optional `?venueId=` — the enrollment token itself stays
+   * venue-agnostic (any venue's staff can scan it; identity comes from
+   * the signature, not from anything venue-specific), but a customer
+   * who's specifically checking in at a known venue right now gets a
+   * QR sized to THAT venue's configured validity window
+   * (`venues.enrollment_qr_ttl_seconds`, owner/manager-configurable —
+   * see `PATCH .../enrollment-qr-ttl` in venueRoutes.js) instead of the
+   * system-wide default. No relationship to the venue is required to
+   * request this — it only affects how long the token lasts, not what
+   * it proves, so there's nothing to authorize beyond "this venue
+   * exists."
    */
-  router.get('/me/enrollment-token', requireAuth, (req, res) => {
+  router.get('/me/enrollment-token', requireAuth, async (req, res, next) => {
+    const { venueId } = req.query;
+    let ttlSeconds = ENROLLMENT_TTL_SECONDS;
+
+    if (venueId !== undefined) {
+      if (!isUuid(venueId)) return res.status(400).json({ error: 'venueId must be a UUID' });
+      try {
+        const { rows } = await pool.query(`SELECT enrollment_qr_ttl_seconds FROM venues WHERE id = $1`, [venueId]);
+        if (!rows[0]) return res.status(404).json({ error: 'venue not found' });
+        ttlSeconds = rows[0].enrollment_qr_ttl_seconds;
+      } catch (err) {
+        return next(err);
+      }
+    }
+
     res.json({
-      enrollmentToken: createEnrollmentToken(req.user.id),
-      expiresInSeconds: ENROLLMENT_TTL_SECONDS,
+      enrollmentToken: createEnrollmentToken(req.user.id, ttlSeconds),
+      expiresInSeconds: ttlSeconds,
     });
   });
 
@@ -241,6 +268,65 @@ function buildAuthRouter(pool) {
         [req.user.id]
       );
       res.json({ entries: rows });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
+   * The server's own VAPID public key, so a browser can create a real
+   * PushSubscription. Not a secret — asymmetric VAPID keys are designed
+   * to be handed to every subscriber — but serving it from here (rather
+   * than baking it into the frontend build) means rotating it needs no
+   * rebuild, and it doubles as the frontend's signal for whether to
+   * offer the "enable notifications" feature at all: `null` when the
+   * server has no VAPID keys configured (self-hosted/local dev without
+   * them), same fallback shape as the Maps API key.
+   */
+  router.get('/push/vapid-public-key', (req, res) => {
+    res.json({ publicKey: isPushConfigured() ? process.env.VAPID_PUBLIC_KEY : null });
+  });
+
+  /**
+   * Register (or refresh) this device's push subscription for the
+   * signed-in user. Upserted by endpoint: a browser re-subscribing with
+   * the same endpoint (its own periodic refresh, or the user granting
+   * permission again) replaces the stored keys rather than creating a
+   * duplicate row that would get double-notified.
+   */
+  router.post('/me/push-subscription', requireAuth, async (req, res, next) => {
+    const { endpoint, keys } = req.body || {};
+    if (typeof endpoint !== 'string' || !endpoint) {
+      return res.status(400).json({ error: 'endpoint is required' });
+    }
+    if (!keys || typeof keys.p256dh !== 'string' || typeof keys.auth !== 'string') {
+      return res.status(400).json({ error: 'keys.p256dh and keys.auth are required' });
+    }
+    try {
+      await pool.query(
+        `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (endpoint) DO UPDATE
+           SET user_id = EXCLUDED.user_id, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth`,
+        [req.user.id, endpoint, keys.p256dh, keys.auth]
+      );
+      res.status(201).json({ subscribed: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /** Turn notifications off for this device. */
+  router.delete('/me/push-subscription', requireAuth, async (req, res, next) => {
+    const { endpoint } = req.body || {};
+    if (typeof endpoint !== 'string' || !endpoint) {
+      return res.status(400).json({ error: 'endpoint is required' });
+    }
+    try {
+      // Scoped by user_id too: a subscription can only be removed by the
+      // account it belongs to, same discipline as every other per-user row.
+      await pool.query(`DELETE FROM push_subscriptions WHERE endpoint = $1 AND user_id = $2`, [endpoint, req.user.id]);
+      res.json({ subscribed: false });
     } catch (err) {
       next(err);
     }

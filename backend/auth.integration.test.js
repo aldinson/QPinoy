@@ -131,9 +131,13 @@ if (!process.env.DATABASE_URL) {
   test('registration requires a mobile number', async () => {
     // Email and mobile are the two channels a venue has for reaching
     // someone whose turn is coming up, so both are mandatory.
-    for (const phone of [undefined, null, '', '   ']) {
+    for (const [i, phone] of [undefined, null, '', '   '].entries()) {
+      // Indexed rather than derived from `phone` itself: a whitespace-only
+      // phone value stringified straight into the local part produces an
+      // email containing spaces (e.g. "nophone-   @..."), which fails
+      // EMAIL_RE and masks the phone check this test is actually for.
       const { status, body } = await api('POST', '/api/auth/register', {
-        body: { email: `nophone-${String(phone)}${SUFFIX}`, password: 'a-good-password', fullName: 'No Phone', phone },
+        body: { email: `nophone-${i}${SUFFIX}`, password: 'a-good-password', fullName: 'No Phone', phone },
       });
       assert.equal(status, 400, `phone ${JSON.stringify(phone)} should be rejected`);
       assert.match(body.error, /mobile number/i);
@@ -427,6 +431,97 @@ if (!process.env.DATABASE_URL) {
     assert.match(body.error, /expired/i);
   });
 
+  // ── Configurable enrollment QR validity ───────────────────────
+
+  test('a fresh enrollment token with no venueId uses the 15-minute system default', async () => {
+    const customer = await register('ttldefaultcustomer');
+    const { status, body } = await api('GET', '/api/me/enrollment-token', { token: customer.token });
+    assert.equal(status, 200);
+    assert.equal(body.expiresInSeconds, 15 * 60);
+  });
+
+  test("an enrollment token requested with a venueId uses that venue's configured TTL", async () => {
+    const owner = await register('ttlvenueowner', 'business');
+    const customer = await register('ttlvenuecustomer');
+    const venue = await createVenue(owner.token);
+
+    const set = await api('PATCH', `/api/venues/${venue.id}/enrollment-qr-ttl`, {
+      token: owner.token,
+      body: { ttlSeconds: 300 },
+    });
+    assert.equal(set.status, 200);
+    assert.equal(set.body.enrollment_qr_ttl_seconds, 300);
+
+    const { status, body } = await api('GET', `/api/me/enrollment-token?venueId=${venue.id}`, { token: customer.token });
+    assert.equal(status, 200);
+    assert.equal(body.expiresInSeconds, 300);
+
+    // The token itself actually carries that lifetime, not just the
+    // response field claiming it does.
+    const { verifyEnrollmentToken } = require('./tokens');
+    const claims = verifyEnrollmentToken(body.enrollmentToken);
+    assert.equal(claims.exp - claims.iat, 300);
+  });
+
+  test('enrollment-token with a nonexistent venueId returns 404', async () => {
+    const customer = await register('ttl404customer');
+    const { status } = await api('GET', '/api/me/enrollment-token?venueId=00000000-0000-0000-0000-000000000000', {
+      token: customer.token,
+    });
+    assert.equal(status, 404);
+  });
+
+  test('enrollment-token with a malformed venueId returns 400, not a database error', async () => {
+    const customer = await register('ttlbadcustomer');
+    const { status } = await api('GET', '/api/me/enrollment-token?venueId=not-a-uuid', { token: customer.token });
+    assert.equal(status, 400);
+  });
+
+  test('owner/manager can configure enrollment-qr-ttl; an attendant cannot', async () => {
+    const owner = await register('ttlpermowner', 'business');
+    const attendant = await register('ttlpermattendant');
+    const venue = await createVenue(owner.token);
+    await api('POST', `/api/venues/${venue.id}/members`, {
+      token: owner.token,
+      body: { email: `ttlpermattendant${SUFFIX}`, role: 'attendant' },
+    });
+
+    const ok = await api('PATCH', `/api/venues/${venue.id}/enrollment-qr-ttl`, {
+      token: owner.token,
+      body: { ttlSeconds: 600 },
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(ok.body.enrollment_qr_ttl_seconds, 600);
+
+    const denied = await api('PATCH', `/api/venues/${venue.id}/enrollment-qr-ttl`, {
+      token: attendant.token,
+      body: { ttlSeconds: 120 },
+    });
+    assert.equal(denied.status, 403);
+  });
+
+  test('enrollment-qr-ttl rejects out-of-range and non-integer values', async () => {
+    const owner = await register('ttlrangeowner', 'business');
+    const venue = await createVenue(owner.token);
+
+    for (const bad of [10, 999999, 300.5, 'soon']) {
+      const { status } = await api('PATCH', `/api/venues/${venue.id}/enrollment-qr-ttl`, {
+        token: owner.token,
+        body: { ttlSeconds: bad },
+      });
+      assert.equal(status, 400, `ttlSeconds ${JSON.stringify(bad)} should be rejected`);
+    }
+  });
+
+  test('enrollment-qr-ttl on a nonexistent venue returns 404', async () => {
+    const owner = await register('ttl404venueowner', 'business');
+    const { status } = await api('PATCH', '/api/venues/00000000-0000-0000-0000-000000000000/enrollment-qr-ttl', {
+      token: owner.token,
+      body: { ttlSeconds: 300 },
+    });
+    assert.equal(status, 404);
+  });
+
   test('SECURITY: a session token cannot be scanned as an enrollment QR code', async () => {
     // Someone photographing a phone showing the app should not be
     // able to feed a copied session token into the scanner.
@@ -524,5 +619,206 @@ if (!process.env.DATABASE_URL) {
     const user = await register('uuiduser');
     const { status } = await api('GET', '/api/venues/not-a-uuid/queue', { token: user.token });
     assert.equal(status, 400);
+  });
+
+  // ── Remote self-join ────────────────────────────────────────────
+
+  test('GET /venues/:id/public requires no auth and exposes only safe fields', async () => {
+    const owner = await register('pubowner', 'business');
+    const venue = await createVenue(owner.token, 'Public Info Venue');
+
+    const { status, body } = await api('GET', `/api/venues/${venue.id}/public`); // no token
+    assert.equal(status, 200);
+    assert.equal(body.venue.id, venue.id);
+    assert.equal(body.venue.name, 'Public Info Venue');
+    assert.equal(body.venue.people_in_line, 0);
+    // Staff-only fields must not leak through the public endpoint.
+    assert.equal(body.venue.geofence_lat, undefined);
+    assert.equal(body.venue.geofence_lng, undefined);
+    assert.equal(body.venue.geofence_radius_meters, undefined);
+  });
+
+  test('GET /venues/:id/public on a nonexistent venue returns 404', async () => {
+    const { status } = await api('GET', '/api/venues/00000000-0000-0000-0000-000000000000/public');
+    assert.equal(status, 404);
+  });
+
+  test('a signed-in customer can join a venue remotely, with no staff scan involved', async () => {
+    const owner = await register('rjowner', 'business');
+    const customer = await register('rjcustomer');
+    const venue = await createVenue(owner.token);
+
+    const { status, body } = await api('POST', `/api/venues/${venue.id}/queue/join`, { token: customer.token });
+    assert.equal(status, 201);
+    assert.equal(body.entry.customer_name, 'rjcustomer');
+    assert.equal(body.entry.user_id, customer.user.id);
+    // Self-joins can't grant themselves a paid/priority tier.
+    assert.equal(body.entry.payment_tier, 'standard_free');
+
+    const mine = await api('GET', '/api/me/queue', { token: customer.token });
+    assert.equal(mine.body.entries.length, 1);
+    assert.equal(mine.body.entries[0].venue_id, venue.id);
+  });
+
+  test('remote join is refused for an anonymous caller', async () => {
+    const owner = await register('rjanonowner', 'business');
+    const venue = await createVenue(owner.token);
+    const { status } = await api('POST', `/api/venues/${venue.id}/queue/join`);
+    assert.equal(status, 401);
+  });
+
+  test('joining the same venue remotely twice is refused, mirroring the QR-scan duplicate check', async () => {
+    const owner = await register('rjdupowner', 'business');
+    const customer = await register('rjdupcustomer');
+    const venue = await createVenue(owner.token);
+
+    const first = await api('POST', `/api/venues/${venue.id}/queue/join`, { token: customer.token });
+    assert.equal(first.status, 201);
+
+    const second = await api('POST', `/api/venues/${venue.id}/queue/join`, { token: customer.token });
+    assert.equal(second.status, 409);
+  });
+
+  test('remote join on a nonexistent venue returns 404', async () => {
+    const customer = await register('rj404customer');
+    const { status } = await api('POST', '/api/venues/00000000-0000-0000-0000-000000000000/queue/join', {
+      token: customer.token,
+    });
+    assert.equal(status, 404);
+  });
+
+  // ── Push notifications ──────────────────────────────────────────
+
+  test('GET /push/vapid-public-key returns null when the server has no VAPID keys configured', async () => {
+    // The test suite never sets VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY —
+    // same "no real credentials needed for tests" shape as the Maps key.
+    const { status, body } = await api('GET', '/api/push/vapid-public-key');
+    assert.equal(status, 200);
+    assert.equal(body.publicKey, null);
+  });
+
+  test('a signed-in customer can register and then remove a push subscription', async () => {
+    const customer = await register('pushcustomer');
+    const subscription = {
+      endpoint: `https://push.example/${customer.user.id}`,
+      keys: { p256dh: 'fake-p256dh-key', auth: 'fake-auth-key' },
+    };
+
+    const registered = await api('POST', '/api/me/push-subscription', { token: customer.token, body: subscription });
+    assert.equal(registered.status, 201);
+    assert.equal(registered.body.subscribed, true);
+
+    // Re-registering the SAME endpoint (a browser refreshing its own
+    // subscription) must upsert, not create a second row for one device.
+    const again = await api('POST', '/api/me/push-subscription', { token: customer.token, body: subscription });
+    assert.equal(again.status, 201);
+    const { rows } = await pool.query(`SELECT count(*)::int AS n FROM push_subscriptions WHERE endpoint = $1`, [
+      subscription.endpoint,
+    ]);
+    assert.equal(rows[0].n, 1);
+
+    const removed = await api('DELETE', '/api/me/push-subscription', {
+      token: customer.token,
+      body: { endpoint: subscription.endpoint },
+    });
+    assert.equal(removed.status, 200);
+    assert.equal(removed.body.subscribed, false);
+
+    const { rows: after } = await pool.query(`SELECT count(*)::int AS n FROM push_subscriptions WHERE endpoint = $1`, [
+      subscription.endpoint,
+    ]);
+    assert.equal(after[0].n, 0);
+  });
+
+  test('registering a push subscription requires an endpoint and both keys', async () => {
+    const customer = await register('pushbadcustomer');
+    const missing = await api('POST', '/api/me/push-subscription', { token: customer.token, body: {} });
+    assert.equal(missing.status, 400);
+
+    const missingKeys = await api('POST', '/api/me/push-subscription', {
+      token: customer.token,
+      body: { endpoint: 'https://push.example/x' },
+    });
+    assert.equal(missingKeys.status, 400);
+  });
+
+  test('SECURITY: a push subscription is anonymous-rejected, and one user cannot delete another user\'s subscription', async () => {
+    const alice = await register('pushalice');
+    const bob = await register('pushbob');
+    const endpoint = 'https://push.example/alice-device';
+
+    const anon = await api('POST', '/api/me/push-subscription', {
+      body: { endpoint, keys: { p256dh: 'k', auth: 'a' } },
+    });
+    assert.equal(anon.status, 401);
+
+    await api('POST', '/api/me/push-subscription', {
+      token: alice.token,
+      body: { endpoint, keys: { p256dh: 'k', auth: 'a' } },
+    });
+
+    // Bob asking to delete Alice's endpoint must not remove it — the
+    // DELETE is scoped by (endpoint, user_id), not endpoint alone.
+    await api('DELETE', '/api/me/push-subscription', { token: bob.token, body: { endpoint } });
+    const { rows } = await pool.query(`SELECT count(*)::int AS n FROM push_subscriptions WHERE endpoint = $1`, [endpoint]);
+    assert.equal(rows[0].n, 1, "Bob must not be able to remove Alice's subscription");
+
+    await pool.query(`DELETE FROM push_subscriptions WHERE endpoint = $1`, [endpoint]);
+  });
+
+  test('calling a customer next sends them a push notification when VAPID is configured', async (t) => {
+    // push.js's "is VAPID configured" flag is cached only once real keys
+    // are SEEN (it never latches on `false`), so setting these now is
+    // enough for the app instance already running in `server` above to
+    // pick them up on its next call — no module-cache tricks needed.
+    process.env.VAPID_PUBLIC_KEY = 'BEzGC0Z6d7ngmYO3rGbDYdDcpCFtJZJTnyKKQITzl-VJiWmXAT4I1npx0lR0re8yeCXsu-miYVS0yRVwwye2jH4';
+    process.env.VAPID_PRIVATE_KEY = 'qBNe8-khHyc2u-mCMwu95WFpYuyZ65xw-RENoGqDrPg';
+    t.after(() => {
+      delete process.env.VAPID_PUBLIC_KEY;
+      delete process.env.VAPID_PRIVATE_KEY;
+    });
+
+    const webpush = require('web-push');
+    const originalSend = webpush.sendNotification;
+    const delivered = [];
+    webpush.sendNotification = async (subscription, body) => {
+      delivered.push({ subscription, body: JSON.parse(body) });
+    };
+    t.after(() => {
+      webpush.sendNotification = originalSend;
+    });
+
+    const owner = await register('pushflowowner', 'business');
+    const customer = await register('pushflowcustomer');
+    const venue = await createVenue(owner.token);
+
+    const endpoint = `https://push.example/${customer.user.id}`;
+    await api('POST', '/api/me/push-subscription', {
+      token: customer.token,
+      body: { endpoint, keys: { p256dh: 'k', auth: 'a' } },
+    });
+
+    const { body: tokenBody } = await api('GET', '/api/me/enrollment-token', { token: customer.token });
+    const enrolled = await api('POST', `/api/venues/${venue.id}/queue/enroll`, {
+      token: owner.token,
+      body: { enrollmentToken: tokenBody.enrollmentToken },
+    });
+
+    const served = await api('POST', `/api/venues/${venue.id}/queue/${enrolled.body.entry.id}/serve`, { token: owner.token });
+    assert.equal(served.status, 200);
+
+    // notifyAfterServe is deliberately fire-and-forget (not awaited by
+    // the HTTP response) — poll briefly rather than assuming delivery
+    // landed the instant the request above resolved.
+    const deadline = Date.now() + 2000;
+    while (delivered.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0].subscription.endpoint, endpoint);
+    assert.equal(delivered[0].body.title, "It's your turn");
+
+    await pool.query(`DELETE FROM push_subscriptions WHERE endpoint = $1`, [endpoint]);
   });
 }

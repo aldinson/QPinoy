@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import QRCode from 'qrcode';
 import {
   MapPin,
   MapPinOff,
@@ -16,6 +17,11 @@ import {
   QrCode,
   Users,
   LogOut,
+  UserX,
+  Link2,
+  Copy,
+  Check,
+  Settings,
 } from 'lucide-react';
 import { COLORS, FONT_MONO, FONT_SANS } from './theme';
 import { api } from './api';
@@ -67,7 +73,161 @@ function isAtRiskClient(entry, now = Date.now()) {
   return now + entry.live_eta_minutes * 60000 > new Date(entry.expected_slot_at).getTime();
 }
 
-function QueueRow({ entry, rank, isFirstWaiting, canMoveUp, canMoveDown, busy, onServe, onReinstate, onMove }) {
+/**
+ * The venue's shareable "join our line remotely" link and QR — the
+ * counterpart to the customer's own personal enrollment QR
+ * (CustomerHome.jsx). This one is static (no expiry, no per-customer
+ * identity in it — it's just the venue id) and is meant to be printed at
+ * the front desk, posted on the venue's site, or shared however the
+ * business likes, so a customer can join before ever setting foot inside.
+ */
+function JoinLinkCard({ venueId }) {
+  const [dataUrl, setDataUrl] = useState(null);
+  const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef(null);
+  const joinUrl = `${window.location.origin}/join?venue=${venueId}`;
+
+  useEffect(() => {
+    let cancelled = false;
+    QRCode.toDataURL(joinUrl, {
+      width: 220,
+      margin: 1,
+      errorCorrectionLevel: 'M',
+      color: { dark: '#22252E', light: '#F4EEE3' },
+    }).then((url) => {
+      if (!cancelled) setDataUrl(url);
+    });
+    return () => {
+      cancelled = true;
+      clearTimeout(copyTimerRef.current);
+    };
+  }, [joinUrl]);
+
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(joinUrl);
+      setCopied(true);
+      clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => setCopied(false), 2000);
+    } catch {
+      /* clipboard API can be blocked (permissions, non-HTTPS) — the URL
+         text below is still there to select and copy by hand */
+    }
+  }
+
+  return (
+    <Card style={{ marginBottom: 20 }}>
+      <div className="text-sm font-semibold mb-1" style={{ color: COLORS.textOnPaper }}>
+        Let customers join remotely
+      </div>
+      <div className="text-xs mb-3" style={{ color: COLORS.textOnPaperDim, lineHeight: 1.5 }}>
+        Print this at the front desk, or share the link — anyone with it can join your line
+        without a staff member scanning them in.
+      </div>
+      <div className="flex items-start gap-3">
+        {dataUrl && (
+          <img
+            src={dataUrl}
+            alt="QR code linking to this venue's remote join page"
+            className="rounded-lg shrink-0"
+            style={{ width: 110, height: 110, imageRendering: 'pixelated' }}
+          />
+        )}
+        <div className="min-w-0 flex-1">
+          <div
+            className="text-xs px-2 py-1.5 rounded-lg mb-2 truncate"
+            style={{ backgroundColor: 'rgba(34,37,46,0.06)', color: COLORS.textOnPaperDim, fontFamily: FONT_MONO }}
+          >
+            {joinUrl}
+          </div>
+          <IconButton icon={copied ? Check : Copy} label={copied ? 'Copied' : 'Copy link'} tone={copied ? 'jade' : 'neutral'} onClick={copyLink} />
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+// Presets for venues.enrollment_qr_ttl_seconds — mirrors the backend's
+// bounds (60-3600s, venueRoutes.js) with round, explainable values
+// rather than a raw number input.
+const QR_TTL_PRESETS = [
+  { label: '2 minutes', value: 120 },
+  { label: '5 minutes', value: 300 },
+  { label: '15 minutes (recommended)', value: 900 },
+  { label: '30 minutes', value: 1800 },
+  { label: '60 minutes', value: 3600 },
+];
+
+/**
+ * Owner/manager control for how long a CUSTOMER'S check-in QR stays
+ * valid when it was requested with this venue in mind (see the long
+ * comment on GET /me/enrollment-token in authRoutes.js — the token
+ * itself is venue-agnostic; this setting only takes effect because
+ * CustomerHome.jsx passes venueId when the customer holds exactly one
+ * active ticket).
+ */
+function EnrollmentTtlCard({ venueId, ttlSeconds, onChanged }) {
+  const [value, setValue] = useState(ttlSeconds);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState(null);
+  const savedTimerRef = useRef(null);
+
+  useEffect(() => {
+    setValue(ttlSeconds);
+    return () => clearTimeout(savedTimerRef.current);
+  }, [ttlSeconds]);
+
+  async function save() {
+    setSaving(true);
+    setError(null);
+    try {
+      const result = await api.setEnrollmentQrTtl(venueId, value);
+      onChanged(result.enrollment_qr_ttl_seconds);
+      setSaved(true);
+      clearTimeout(savedTimerRef.current);
+      savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
+    } catch (err) {
+      setError(err.message || 'Could not save');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // Not one of the presets (e.g. set by an earlier version, or another
+  // client) — still show it rather than silently snapping to the
+  // nearest preset and pretending nothing changed.
+  const options =
+    ttlSeconds != null && !QR_TTL_PRESETS.some((p) => p.value === ttlSeconds)
+      ? [...QR_TTL_PRESETS, { label: `${Math.round(ttlSeconds / 60)} minutes (current)`, value: ttlSeconds }]
+      : QR_TTL_PRESETS;
+
+  return (
+    <Card style={{ marginBottom: 20 }}>
+      <div className="text-sm font-semibold mb-1" style={{ color: COLORS.textOnPaper }}>
+        Check-in code validity
+      </div>
+      <div className="text-xs mb-3" style={{ color: COLORS.textOnPaperDim, lineHeight: 1.5 }}>
+        How long a customer's check-in QR stays scannable before it expires and their screen
+        refreshes it. Shorter is safer — a photographed code goes stale sooner; longer is more
+        forgiving if your line moves slowly.
+      </div>
+      <Alert>{error}</Alert>
+      <Select value={value} onChange={(e) => setValue(Number(e.target.value))}>
+        {options.map((p) => (
+          <option key={p.value} value={p.value}>
+            {p.label}
+          </option>
+        ))}
+      </Select>
+      <Button onClick={save} disabled={saving || value === ttlSeconds}>
+        {saving ? 'Saving…' : saved ? 'Saved' : 'Save'}
+      </Button>
+    </Card>
+  );
+}
+
+function QueueRow({ entry, rank, isFirstWaiting, canMoveUp, canMoveDown, busy, onServe, onReinstate, onMove, onNoShow }) {
   const atRisk = isAtRiskClient(entry);
   const affected = entry.last_automation_flag === 'stepped_back' || entry.last_automation_flag === 'dropped';
 
@@ -127,6 +287,14 @@ function QueueRow({ entry, rank, isFirstWaiting, canMoveUp, canMoveDown, busy, o
           {affected && !entry.is_override_locked && <IconButton icon={Undo2} label="Reinstate" tone="brass" onClick={onReinstate} disabled={busy} />}
         </div>
       )}
+
+      {entry.status === 'serving' && (
+        <div className="flex items-center gap-1.5 flex-wrap pt-0.5">
+          {/* Mark BEFORE calling the next customer — otherwise the next
+              "call next" silently records this person as served. */}
+          <IconButton icon={UserX} label="No-show" tone="rust" onClick={onNoShow} disabled={busy} />
+        </div>
+      )}
     </div>
   );
 }
@@ -145,6 +313,9 @@ export default function AttendantDashboard({ venueId, navigate }) {
   const [scanBusy, setScanBusy] = useState(false);
   const [scanStatus, setScanStatus] = useState(null);
   const [scanTier, setScanTier] = useState('standard_free');
+
+  const [showJoinLink, setShowJoinLink] = useState(false);
+  const [showQrSettings, setShowQrSettings] = useState(false);
 
   const [showWalkIn, setShowWalkIn] = useState(false);
   const [walkInName, setWalkInName] = useState('');
@@ -281,6 +452,14 @@ export default function AttendantDashboard({ venueId, navigate }) {
             <Button variant="secondary" onClick={() => setShowWalkIn((v) => !v)}>
               <Plus size={14} /> Walk-in
             </Button>
+            <Button variant="secondary" onClick={() => setShowJoinLink((v) => !v)}>
+              <Link2 size={14} /> Join link
+            </Button>
+            {canManageStaff && (
+              <Button variant="secondary" onClick={() => setShowQrSettings((v) => !v)}>
+                <Settings size={14} /> QR settings
+              </Button>
+            )}
             {canManageStaff && (
               <Button variant="secondary" onClick={() => navigate(`/staff?venue=${venueId}`)}>
                 <Users size={14} /> Staff
@@ -306,6 +485,16 @@ export default function AttendantDashboard({ venueId, navigate }) {
               statusMessage={scanStatus}
             />
           </Card>
+        )}
+
+        {showJoinLink && <JoinLinkCard venueId={venueId} />}
+
+        {showQrSettings && venue && (
+          <EnrollmentTtlCard
+            venueId={venueId}
+            ttlSeconds={venue.enrollment_qr_ttl_seconds}
+            onChanged={(sec) => setVenue((v) => ({ ...v, enrollment_qr_ttl_seconds: sec }))}
+          />
         )}
 
         {showWalkIn && (
@@ -353,6 +542,7 @@ export default function AttendantDashboard({ venueId, navigate }) {
                 onServe={() => runAction(entry.id, () => api.serve(venueId, entry.id))}
                 onReinstate={() => runAction(entry.id, () => api.reinstate(venueId, entry.id))}
                 onMove={(direction) => runAction(entry.id, () => api.move(venueId, entry.id, direction))}
+                onNoShow={() => runAction(entry.id, () => api.noShow(venueId, entry.id))}
               />
             ))}
           </div>

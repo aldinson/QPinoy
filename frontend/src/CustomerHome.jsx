@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import QRCode from 'qrcode';
-import { MapPin, MapPinOff, Lock, AlertTriangle, Navigation, LogOut, RefreshCw } from 'lucide-react';
+import { MapPin, MapPinOff, Lock, AlertTriangle, Navigation, LogOut, RefreshCw, Bell, BellOff } from 'lucide-react';
 import { COLORS, FONT_MONO } from './theme';
 import { api } from './api';
 import { useAuth } from './auth';
@@ -9,16 +9,139 @@ import { Screen, Card, Button, Alert } from './ui';
 const QUEUE_POLL_MS = 5000;
 const MIN_PING_INTERVAL_MS = 15000;
 
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = window.atob(base64);
+  return Uint8Array.from([...rawData].map((c) => c.charCodeAt(0)));
+}
+
+/**
+ * "Enable notifications" — the customer-facing half of the push channel
+ * DEPLOYMENT.md (§4) recommends in place of trusting a phone's last
+ * stored location once its screen locks: the server pushes at the exact
+ * moment it matters, and the tap itself is a fresh presence signal.
+ *
+ * Renders nothing at all — not even a disabled state — when there's
+ * nothing to offer: no browser push support, or the backend has no
+ * VAPID keys configured (self-hosted/local dev without them).
+ */
+function NotificationsCard() {
+  const [publicKey, setPublicKey] = useState(null);
+  // checking | unsupported | denied | off | on
+  const [status, setStatus] = useState('checking');
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+        if (!cancelled) setStatus('unsupported');
+        return;
+      }
+      try {
+        const { publicKey: key } = await api.getVapidPublicKey();
+        if (!key) {
+          if (!cancelled) setStatus('unsupported');
+          return;
+        }
+        if (cancelled) return;
+        setPublicKey(key);
+
+        if (Notification.permission === 'denied') {
+          setStatus('denied');
+          return;
+        }
+        const registration = await navigator.serviceWorker.ready;
+        const existing = await registration.pushManager.getSubscription();
+        if (!cancelled) setStatus(existing ? 'on' : 'off');
+      } catch {
+        if (!cancelled) setStatus('unsupported');
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function enable() {
+    setError(null);
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey),
+      });
+      await api.subscribePush(subscription.toJSON());
+      setStatus('on');
+    } catch (err) {
+      // A permission prompt the visitor dismissed/denied surfaces here
+      // as a rejected subscribe() call, not a thrown error worth
+      // showing raw — check the resulting permission state instead.
+      if (typeof Notification !== 'undefined' && Notification.permission === 'denied') setStatus('denied');
+      else setError(err.message || 'Could not enable notifications');
+    }
+  }
+
+  async function disable() {
+    setError(null);
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const subscription = await registration.pushManager.getSubscription();
+      if (subscription) {
+        await api.unsubscribePush(subscription.endpoint).catch(() => {});
+        await subscription.unsubscribe();
+      }
+      setStatus('off');
+    } catch (err) {
+      setError(err.message || 'Could not turn off notifications');
+    }
+  }
+
+  if (status === 'checking' || status === 'unsupported') return null;
+
+  return (
+    <Card style={{ marginBottom: 12 }}>
+      <div className="flex items-center gap-2 text-sm font-semibold mb-1" style={{ color: COLORS.textOnInk }}>
+        {status === 'on' ? <Bell size={15} color={COLORS.jade} /> : <BellOff size={15} color={COLORS.textOnInkDim} />}
+        Notifications {status === 'on' ? 'on' : 'off'}
+      </div>
+      <div className="text-xs mb-3" style={{ color: COLORS.textOnInkDim, lineHeight: 1.5 }}>
+        Get a tap-to-confirm alert when you're next — even with the app closed.
+      </div>
+      <Alert>{error}</Alert>
+      {status === 'denied' ? (
+        <div className="text-xs" style={{ color: COLORS.rust }}>
+          Notifications are blocked for this site. Allow them in your browser's site settings to turn this on.
+        </div>
+      ) : status === 'on' ? (
+        <Button full variant="secondary" onClick={disable}>
+          <BellOff size={14} /> Turn off
+        </Button>
+      ) : (
+        <Button full onClick={enable}>
+          <Bell size={14} /> Turn on notifications
+        </Button>
+      )}
+    </Card>
+  );
+}
+
 /**
  * The customer's home screen: their check-in QR code, plus their live
  * place in any line they've been scanned into.
  *
  * The QR encodes a short-lived signed enrollment token, NOT the
- * user's ID — see backend/tokens.js. Because the token expires after
- * ~90 seconds, this component refreshes it on a timer well before
- * that, so the code on screen is always scannable.
+ * user's ID — see backend/tokens.js. Because the token eventually
+ * expires, this component refreshes it on a timer well before that, so
+ * the code on screen is always scannable.
+ *
+ * `venueId`, when known (the customer holds exactly one active
+ * ticket — see the default export below), sizes the token to THAT
+ * venue's own configured validity window instead of the system-wide
+ * default; owner/manager can tune it in AttendantDashboard.jsx.
  */
-function EnrollmentQr() {
+function EnrollmentQr({ venueId }) {
   const [dataUrl, setDataUrl] = useState(null);
   const [error, setError] = useState(null);
   const [secondsLeft, setSecondsLeft] = useState(null);
@@ -26,7 +149,7 @@ function EnrollmentQr() {
 
   const refresh = useCallback(async () => {
     try {
-      const { enrollmentToken, expiresInSeconds } = await api.getEnrollmentToken();
+      const { enrollmentToken, expiresInSeconds } = await api.getEnrollmentToken(venueId);
       // Rendered to a data URL rather than a canvas ref so React owns
       // the DOM node and there's no imperative cleanup to get wrong.
       const url = await QRCode.toDataURL(enrollmentToken, {
@@ -50,7 +173,7 @@ function EnrollmentQr() {
     } catch (err) {
       setError(err.message || 'Could not load your check-in code');
     }
-  }, []);
+  }, [venueId]);
 
   useEffect(() => {
     refresh();
@@ -247,7 +370,11 @@ export default function CustomerHome() {
         </div>
       )}
 
-      <EnrollmentQr />
+      <NotificationsCard />
+      {/* Exactly one active ticket is the only case where "which
+          venue's TTL setting applies" is unambiguous — zero or several
+          fall back to the system-wide default inside EnrollmentQr. */}
+      <EnrollmentQr venueId={entries.length === 1 ? entries[0].venue_id : undefined} />
 
       <div className="mt-6">
         <Button variant="secondary" onClick={signOut}>

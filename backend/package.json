@@ -7,7 +7,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test": "node --test",
-    "test:unit": "node --test queueCore.test.js geofence.test.js distanceMatrixClient.test.js password.test.js tokens.test.js rateLimit.test.js",
+    "test:unit": "node --test queueCore.test.js geofence.test.js distanceMatrixClient.test.js password.test.js tokens.test.js rateLimit.test.js phone.test.js push.test.js",
     "test:integration": "node --test queueEngine.integration.test.js routes.integration.test.js auth.integration.test.js rateLimit.integration.test.js",
     "db:schema": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f schema.sql",
     "db:seed": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f seed.sql",
@@ -16,9 +16,10 @@
     "smoke": "node smoke.js"
   },
   "dependencies": {
+    "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "pg": "^8.12.0",
-    "dotenv": "^16.4.5"
+    "web-push": "^3.6.7"
   },
   "engines": {
     "node": ">=20.0.0"

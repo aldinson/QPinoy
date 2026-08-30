@@ -5,9 +5,36 @@ salons). The core idea: a customer's place in line depends on both **whether
 they're physically present** and **how much they've committed financially** —
 so the line self-corrects around no-shows without punishing everyone equally.
 
-**136 automated tests. No placeholder code.** Every layer — the pure algorithm,
+**177 automated tests. No placeholder code.** Every layer — the pure algorithm,
 the SQL transactions, the HTTP endpoints, the service worker — is tested
 against real infrastructure, not mocks.
+
+## Recent additions
+
+- **No-show, distinct from served.** Calling the next customer used to
+  auto-mark whoever was previously `serving` as `served`, even if they
+  never showed up — silently poisoning any future no-show-rate or
+  service-time analytics. `POST /venues/:id/queue/:entryId/no-show`
+  (`routes.js`, `queueEngine.js:markNoShow`) lets an attendant record a
+  no-show explicitly, before calling the next customer, instead.
+- **Staff no longer see raw coordinates.** `GET /venues/:id/queue` used
+  to `SELECT *`, which included `last_lat`/`last_lng` in the JSON
+  response even though the UI never rendered them. The query is now an
+  explicit column list — staff see presence *state* ("checked in" / "at
+  risk"), never a customer's exact location.
+- **Remote self-join.** Every join path used to require a staff member
+  scanning the customer's QR. `GET /venues/:id/public` (no auth) plus
+  `POST /venues/:id/queue/join` (signed-in customer, no staff involved)
+  let a venue share a link/QR — `frontend/src/JoinVenue.jsx` is the
+  landing page, and the attendant console has a "Join link" card
+  (`AttendantDashboard.jsx`) to generate it.
+- **Web Push notifications.** The queue engine now sends a real push
+  notification at the moments DEPLOYMENT.md (§4) called out — "it's your
+  turn," "you're next," "you were temporarily skipped" — instead of
+  relying entirely on the customer keeping a tab open and polling.
+  `backend/push.js` wraps `web-push`; no-ops cleanly when `VAPID_PUBLIC_KEY`/
+  `VAPID_PRIVATE_KEY` aren't set, the same fallback shape
+  `distanceMatrixClient.js` uses for `GOOGLE_MAPS_API_KEY`.
 
 ## Quick start
 
@@ -47,13 +74,14 @@ backend/                       Node/Express API + Postgres
   server.js                     Process bootstrap for Docker/Render/local dev: app.js + db.js + listen()
   geofence.js                   Haversine presence math (server-authoritative)
   distanceMatrixClient.js       Swappable ETA adapter (Google, or offline fallback)
+  push.js                       Web Push notifications (no-ops without VAPID keys)
   schema.sql                    DDL, enums, partial indexes
   seed.sql                      Demo data (full reset, idempotent)
   smoke.js                      Scripted end-to-end walkthrough
   seedAccounts.js               Demo logins, one per role (hashing can't live in .sql)
   Dockerfile                    Multi-stage production build
   .env.example                  Copy to .env for local dev
-  *.test.js                     136 tests (73 unit, 63 integration)
+  *.test.js                     172 tests (82 unit, 90 integration)
 
 netlify/functions/api.js       Wraps backend/app.js with serverless-http for Netlify deploys
 
@@ -62,14 +90,15 @@ frontend/                      Vite + React + Tailwind PWA
   src/auth.jsx                  AuthProvider — session state, revalidated on every boot
   src/AuthScreens.jsx           Sign in / register
   src/VenueSetup.jsx            First-run venue creation for a business account
-  src/AttendantDashboard.jsx    Staff console — scan customers, call next, reinstate, move
+  src/AttendantDashboard.jsx    Staff console — scan customers, call next, no-show, reinstate, move
   src/QrScanner.jsx             Camera QR reader (BarcodeDetector, jsQR fallback, manual entry)
   src/StaffMembers.jsx          The staff roster: authorize and revoke
-  src/CustomerHome.jsx          The customer's rotating check-in QR + their place in line
+  src/CustomerHome.jsx          The customer's check-in QR, live position, and notifications toggle
+  src/JoinVenue.jsx             Remote self-join landing page ("/join?venue=<id>")
   src/InstallPrompt.jsx         Android install banner (captures beforeinstallprompt)
   src/api.js                    Fetch client for the backend (attaches the Bearer token)
   src/QueueSimulator.jsx        In-memory algorithm demo — mirrors the real algorithm, no backend needed
-  src/sw.js                     Service worker (build-time precache injection)
+  src/sw.js                     Service worker (build-time precache injection, push notifications)
   public/                       manifest.json, offline.html, icons
   test/                         5 service worker install tests
 
@@ -105,7 +134,8 @@ The app routes you by role automatically:
 - **Customers** land on their check-in QR and their live position, with
   a "Share my location" button that geofences them in server-side (see
   [DEPLOYMENT.md §4](DEPLOYMENT.md) for the platform limits this works
-  within).
+  within) and, when `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY` are set, a
+  "Turn on notifications" card that works even with the app closed.
 - **`/demo`** — reachable signed-out — is
   `frontend/src/QueueSimulator.jsx`, a real, running mirror
   of the backend algorithm with no backend required — not a mockup, just
@@ -364,17 +394,22 @@ whose user holds a role at that venue. See "Accounts and roles" above.
 | `GET /api/auth/me` | Current user + every venue they staff |
 | `GET /api/me/enrollment-token` | Short-lived token the customer's phone renders as a QR code |
 | `GET /api/me/queue` | The customer's own live tickets, with position computed server-side |
+| `GET /api/push/vapid-public-key` | The server's VAPID public key, or `null` if push isn't configured — no auth |
+| `POST`/`DELETE /api/me/push-subscription` | Register/remove this device's Web Push subscription |
 | `POST /api/venues` | Create a venue; creator becomes its owner |
 | `GET /api/venues/mine` | Venues the signed-in user staffs |
+| `GET /api/venues/:id/public` | Public venue info for a "join our line" link/QR — no auth |
 | `GET`/`POST` `/api/venues/:id/members` | Staff roster / authorize someone (owner + manager only) |
 | `DELETE /api/venues/:id/members/:userId` | Revoke staff access (owner + manager only) |
 
 | Queue endpoint | Effect |
 |---|---|
-| `GET /api/venues/:id/queue` | Live line, in serve order |
-| `POST /api/venues/:id/queue/enroll` | **Scan a customer in** (`{ enrollmentToken, paymentTier? }`) — the primary way people join |
+| `GET /api/venues/:id/queue` | Live line, in serve order (never includes raw `last_lat`/`last_lng`) |
+| `POST /api/venues/:id/queue/enroll` | **Scan a customer in** (`{ enrollmentToken, paymentTier? }`) — staff-initiated |
+| `POST /api/venues/:id/queue/join` | **Self-join remotely** — signed-in customer, no staff scan; always `standard_free` tier |
 | `POST /api/venues/:id/queue` | Add a walk-in with no account, by name (`{ customerName, customerPhone?, paymentTier? }`) |
-| `POST /api/venues/:id/queue/:entryId/serve` | Call next customer (atomic: completes prior, promotes this one, runs the trigger) |
+| `POST /api/venues/:id/queue/:entryId/serve` | Call next customer (atomic: completes prior, promotes this one, runs the trigger, sends push) |
+| `POST /api/venues/:id/queue/:entryId/no-show` | Mark the currently-serving customer a no-show (before calling next — otherwise they'd be recorded as served) |
 | `POST /api/venues/:id/queue/:entryId/reinstate` | Lock-Back override |
 | `POST /api/venues/:id/queue/:entryId/move` | Manual one-slot nudge (`{ "direction": "up" \| "down" }`) |
 | `PATCH /api/venues/:id/automation` | Global toggle (`{ "enabled": true }`) |
@@ -383,7 +418,8 @@ whose user holds a role at that venue. See "Accounts and roles" above.
 
 Copy `.env.example` to `.env` and fill in `DATABASE_URL` (and optionally
 `GOOGLE_MAPS_API_KEY` for live-traffic ETAs instead of the distance-based
-fallback).
+fallback, and `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY` for push notifications —
+generate a pair with `npx web-push generate-vapid-keys`).
 
 ## PWA
 

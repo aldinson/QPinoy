@@ -213,6 +213,14 @@ function rateLimitMiddleware(pool, { limit, windowSeconds, key, message }) {
  *                  is ~7x headroom for retries and clock skew while
  *                  still refusing a tight loop.
  *
+ *  SELF_JOIN     — 5 remote joins per user per hour, across all venues.
+ *                  The one-active-ticket-per-venue DB constraint already
+ *                  stops rejoining the SAME venue while a ticket is
+ *                  live; this catches a script hitting many DIFFERENT
+ *                  venues' join links back to back, which that
+ *                  constraint can't see.
+ *
+
  * Known gap, stated rather than papered over: an attacker with many
  * source IPs can still grind one account, since each IP gets its own
  * per-account budget. Closing that needs a CAPTCHA or step-up
@@ -223,6 +231,7 @@ const LIMITS = {
   LOGIN_ACCOUNT: { limit: 10, windowSeconds: 15 * 60 },
   LOGIN_IP: { limit: 60, windowSeconds: 15 * 60 },
   LOCATION: { limit: 30, windowSeconds: 60 },
+  SELF_JOIN: { limit: 5, windowSeconds: 60 * 60 },
 };
 
 module.exports = {

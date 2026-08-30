@@ -2,6 +2,26 @@ import React, { useState } from 'react';
 import { COLORS } from './theme';
 import { useAuth } from './auth';
 import { Screen, Field, Button, Alert, LinkButton, Card } from './ui';
+import { PENDING_JOIN_KEY } from './JoinVenue';
+
+/**
+ * Where to land after a successful sign-in/registration. If the visitor
+ * got here via a venue's "join our line" link (JoinVenue.jsx stashed the
+ * venue id before sending them to /login or /register), send them back
+ * to finish joining instead of dropping them on the generic home screen.
+ */
+function postAuthDestination() {
+  try {
+    const venueId = sessionStorage.getItem(PENDING_JOIN_KEY);
+    if (venueId) {
+      sessionStorage.removeItem(PENDING_JOIN_KEY);
+      return `/join?venue=${venueId}`;
+    }
+  } catch {
+    /* non-fatal — falls through to the default destination */
+  }
+  return '/';
+}
 
 export function LoginScreen({ navigate }) {
   const { signIn } = useAuth();
@@ -16,7 +36,7 @@ export function LoginScreen({ navigate }) {
     setError(null);
     try {
       await signIn(email.trim(), password);
-      navigate('/');
+      navigate(postAuthDestination());
     } catch (err) {
       setError(err.message || 'Could not sign in');
     } finally {
@@ -83,9 +103,10 @@ export function RegisterScreen({ navigate }) {
         accountType: form.accountType,
       });
       // Business accounts land on venue setup; customers go to their
-      // QR code. App.jsx picks the right home from account_type, so
-      // both just go to '/'.
-      navigate('/');
+      // QR code — App.jsx picks the right home from account_type — UNLESS
+      // this registration was to finish a pending remote join, which
+      // takes priority.
+      navigate(postAuthDestination());
     } catch (err) {
       setError(err.message || 'Could not create your account');
     } finally {

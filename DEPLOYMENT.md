@@ -162,15 +162,32 @@ parking outside.
 This isn't a bug in the code. It's a platform limit, and you have to
 design around it. Four options, roughly in order of effort:
 
-**A. Pull, don't push (recommended).** Invert the flow: instead of
-passively trusting stored coordinates, *actively ask* when it matters.
-When someone reaches the two-slot-prior mark, send them a web push:
-"You're next in ~10 minutes — tap to confirm you're on the way." The
-tap opens the app, which takes a fresh location reading. The tap
-itself is a strong presence signal. This fits your existing
-architecture almost exactly — the trigger already knows the right
-moment to ask. Give them a response window before treating silence as
-absence.
+**A. Pull, don't push (recommended) — BUILT.** Invert the flow: instead
+of passively trusting stored coordinates, *actively tell* the customer
+when it matters. `backend/push.js` + `frontend/src/sw.js`'s `push`
+handler now send a real Web Push notification at three moments the
+queue engine already knows about: the instant someone is promoted to
+`serving` ("It's your turn"), the instant a new customer becomes
+next-in-line ("You're next"), and the instant the two-slot-prior trigger
+steps someone back or drops them ("You were temporarily skipped"). See
+`queueEngine.js`'s `notifyAfterServe`.
+
+Two pieces of the original recommendation are **not yet built**, worth
+knowing before you rely on this: the tap on a notification currently
+just opens/focuses the app (`notificationclick` in `sw.js`) rather than
+automatically taking a fresh location reading — the customer still has
+to (re-)tap "Share my location" if they'd stopped sharing — and there's
+no explicit response window / "treat silence as absence" grace period.
+The two-slot-prior trigger fires on its own schedule regardless of
+whether a push was seen.
+
+No-op by design without credentials: set `VAPID_PUBLIC_KEY` and
+`VAPID_PRIVATE_KEY` (generate a pair once per environment with
+`npx web-push generate-vapid-keys` — **not** per deploy, rotating it
+invalidates every existing subscription) to turn it on. Without them,
+`GET /api/push/vapid-public-key` returns `null` and the frontend's
+"enable notifications" card simply doesn't render — same fallback shape
+as `GOOGLE_MAPS_API_KEY`.
 
 Web Push works on Android, and on iOS 16.4+ **only when the user has
 installed the PWA to their home screen** — a real caveat worth
@@ -267,6 +284,11 @@ the PWA.
       restrict by **API** (Distance Matrix only) and set a billing
       quota/alert instead — an unrestricted key will get scraped and
       billed to you either way
+- [ ] `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY` set (see §4A) if you want
+      push notifications live for launch — generate once with
+      `npx web-push generate-vapid-keys` and treat the private key like
+      any other secret; without these two, the app runs fine, it just
+      never offers "enable notifications" to customers
 - [ ] A cron hitting `POST /api/venues/:id/rebalance` nightly per
       venue — a free option on Netlify is a
       [Scheduled Function](https://docs.netlify.com/functions/scheduled-functions/);

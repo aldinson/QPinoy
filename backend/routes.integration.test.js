@@ -64,8 +64,8 @@ if (!process.env.DATABASE_URL) {
 
     await pool.query(`DELETE FROM users WHERE id = $1 OR email = $2`, [STAFF_USER_ID, STAFF_EMAIL]);
     await pool.query(
-      `INSERT INTO users (id, email, password_hash, full_name, account_type)
-       VALUES ($1, $2, $3, 'Routes Suite Staff', 'business')`,
+      `INSERT INTO users (id, email, password_hash, full_name, phone, account_type)
+       VALUES ($1, $2, $3, 'Routes Suite Staff', '+15550199', 'business')`,
       [STAFF_USER_ID, STAFF_EMAIL, await hashPassword('irrelevant-for-these-tests')]
     );
     authToken = createSessionToken(STAFF_USER_ID);
@@ -146,6 +146,15 @@ if (!process.env.DATABASE_URL) {
     assert.deepEqual(body.queue.map((r) => r.customer_name), ['A', 'B', 'C', 'D']);
   });
 
+  test('GET /queue never includes raw last_lat/last_lng — staff see presence state, not coordinates', async () => {
+    await api('PATCH', `/api/venues/${VENUE_ID}/queue/${IDS.d}/location`, { lat: 40.0001, lng: -74.0001 });
+    const { body } = await api('GET', `/api/venues/${VENUE_ID}/queue`);
+    for (const row of body.queue) {
+      assert.equal('last_lat' in row, false);
+      assert.equal('last_lng' in row, false);
+    }
+  });
+
   test('GET /queue on a venue with no rows returns an empty array, not an error', async () => {
     const emptyVenueId = '00000000-0000-0000-0000-000000000098';
     // Defensive, for the same reason as the cross-venue test below: a
@@ -169,6 +178,27 @@ if (!process.env.DATABASE_URL) {
     const names = queueBody.queue.map((r) => r.customer_name);
     assert.equal(names[0], 'A');
     assert.ok(names.indexOf('D') < names.indexOf('C')); // C cascaded behind D
+  });
+
+  test('POST /no-show on a WAITING customer is rejected with 409 — only the serving slot can be marked', async () => {
+    const { status, body } = await api('POST', `/api/venues/${VENUE_ID}/queue/${IDS.b}/no-show`);
+    assert.equal(status, 409);
+    assert.ok(body.error);
+  });
+
+  test('POST /no-show on the currently-serving customer records no_show, not served, and frees the slot', async () => {
+    await api('POST', `/api/venues/${VENUE_ID}/queue/${IDS.a}/serve`);
+
+    const { status, body } = await api('POST', `/api/venues/${VENUE_ID}/queue/${IDS.a}/no-show`);
+    assert.equal(status, 200);
+    assert.equal(body.reason, 'no_show');
+
+    const { rows } = await pool.query(`SELECT status FROM queue_entries WHERE id = $1`, [IDS.a]);
+    assert.equal(rows[0].status, 'no_show');
+
+    const { body: queueBody } = await api('GET', `/api/venues/${VENUE_ID}/queue`);
+    assert.ok(!queueBody.queue.some((r) => r.id === IDS.a));
+    assert.ok(!queueBody.queue.some((r) => r.status === 'serving'));
   });
 
   test('POST /reinstate guarantees next-in-line and locks the row', async () => {

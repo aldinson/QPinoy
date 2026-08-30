@@ -90,14 +90,20 @@ const CUSTOMER_EMAIL = `smoke-customer-${RUN}@smoke.local`;
     // ── Accounts ────────────────────────────────────────────────
     console.log('\n> POST /auth/register  (business owner)');
     const owner = await call('POST', '/api/auth/register', {
-      body: { email: OWNER_EMAIL, password: 'smoke-password', fullName: 'Smoke Owner', accountType: 'business' },
+      body: {
+        email: OWNER_EMAIL,
+        password: 'smoke-password',
+        fullName: 'Smoke Owner',
+        phone: '0917 000 0001',
+        accountType: 'business',
+      },
     });
     console.log('  status:', owner.status, '| account_type:', owner.body.user.account_type);
     const ownerToken = owner.body.token;
 
     console.log('\n> POST /auth/register  (customer)');
     const customer = await call('POST', '/api/auth/register', {
-      body: { email: CUSTOMER_EMAIL, password: 'smoke-password', fullName: 'Smoke Customer' },
+      body: { email: CUSTOMER_EMAIL, password: 'smoke-password', fullName: 'Smoke Customer', phone: '0917 000 0002' },
     });
     console.log('  status:', customer.status);
     const customerToken = customer.body.token;

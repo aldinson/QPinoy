@@ -1,30 +1,76 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import jsQR from 'jsqr';
-import { Camera, X, Keyboard } from 'lucide-react';
+import { Camera, X, Keyboard, Upload } from 'lucide-react';
 import { COLORS } from './theme';
 import { Button, Alert, Field } from './ui';
 
 /**
  * QrScanner — camera-based QR reading for the staff console.
  *
- * Two decoding paths, in order of preference:
+ * Three ways to get a customer's check-in code in, in order of how
+ * often they'll actually get used:
  *
- *  1. `BarcodeDetector`, the browser's own native decoder. It is
- *     available in Chrome on Android, which is this app's stated
- *     target platform, and it is markedly faster and better at odd
- *     angles and low light than anything running in JS.
- *  2. `jsQR` in a canvas loop, for every other browser (including
- *     desktop Chrome, where BarcodeDetector is not enabled by
- *     default). Slower, but it works everywhere and keeps the feature
- *     from being Android-Chrome-only during development.
+ *  1. Live camera scan. `BarcodeDetector` (the browser's own native
+ *     decoder — available in Chrome on Android, this app's stated
+ *     target platform, and markedly faster/more tolerant of odd angles
+ *     than anything running in JS) when available, falling back to
+ *     `jsQR` in a canvas loop everywhere else (including desktop
+ *     Chrome, where BarcodeDetector isn't enabled by default).
+ *  2. Upload a QR image. Covers the case a live scan can't: a customer
+ *     who isn't physically in front of staff — they screenshot or
+ *     photograph their check-in QR and send it over (chat app, email,
+ *     AirDrop), and staff upload that image file instead. Same two
+ *     decoders as the camera path, just run once against a still image
+ *     instead of a video frame loop.
+ *  3. Manual text entry. Not decoration: a cracked lens, a denied
+ *     camera permission, or a customer whose screen won't brighten all
+ *     produce a front desk that cannot serve someone, and a code they
+ *     can read aloud gets them moving.
  *
- * There is also a manual-entry fallback. That is not decoration: a
- * cracked lens, a denied camera permission, or a customer whose
- * screen won't brighten all produce a front desk that cannot serve
- * someone, and a code they can read aloud gets them moving.
+ * Worth knowing about path 2 specifically: the enrollment QR is a
+ * signed token that expires in 90 seconds (see backend/tokens.js) by
+ * design — a static code would be a permanent credential visible on a
+ * public screen. That means "send me a screenshot" only works if the
+ * whole screenshot → send → upload round trip finishes inside that
+ * window; a stale one fails with the same "expired" message staff
+ * already see from a stale live scan (routes.js's enroll handler), not
+ * a confusing image-decode error.
  */
 
 const SCAN_INTERVAL_MS = 250;
+
+/**
+ * Decode a QR code out of a still image file. Same detector preference
+ * as the live camera loop (native BarcodeDetector first, jsQR fallback),
+ * just run once against a full-resolution bitmap instead of a video
+ * frame, so it's worth trying harder per attempt (`attemptBoth` inversion)
+ * than the live loop bothers to at 4 scans/second.
+ */
+async function decodeQrFromImageFile(file) {
+  const bitmap = await createImageBitmap(file);
+  try {
+    if ('BarcodeDetector' in window) {
+      try {
+        const detector = new window.BarcodeDetector({ formats: ['qr_code'] });
+        const codes = await detector.detect(bitmap);
+        if (codes.length) return codes[0].rawValue;
+      } catch {
+        // Fall through to jsQR — same reasoning as the live-scan path.
+      }
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bitmap, 0, 0);
+    const { data, width, height } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const found = jsQR(data, width, height, { inversionAttempts: 'attemptBoth' });
+    return found?.data || null;
+  } finally {
+    bitmap.close?.();
+  }
+}
 
 export default function QrScanner({ onScan, onCancel, busy, statusMessage }) {
   const videoRef = useRef(null);
@@ -32,6 +78,7 @@ export default function QrScanner({ onScan, onCancel, busy, statusMessage }) {
   const streamRef = useRef(null);
   const loopRef = useRef(null);
   const detectorRef = useRef(null);
+  const fileInputRef = useRef(null);
   // Guards against the same code firing repeatedly while the frame
   // loop keeps seeing it during the enroll round-trip.
   const lastCodeRef = useRef({ value: null, at: 0 });
@@ -39,6 +86,8 @@ export default function QrScanner({ onScan, onCancel, busy, statusMessage }) {
   const [cameraError, setCameraError] = useState(null);
   const [manualMode, setManualMode] = useState(false);
   const [manualValue, setManualValue] = useState('');
+  const [uploadError, setUploadError] = useState(null);
+  const [decodingUpload, setDecodingUpload] = useState(false);
 
   const handleCode = useCallback(
     (value) => {
@@ -49,6 +98,33 @@ export default function QrScanner({ onScan, onCancel, busy, statusMessage }) {
       onScan(value);
     },
     [onScan]
+  );
+
+  const handleFileChange = useCallback(
+    async (e) => {
+      const file = e.target.files?.[0];
+      // Reset the input so choosing the SAME file again (e.g. after an
+      // expired-token error, once the customer sends a fresh screenshot
+      // saved under the same name) still fires a change event.
+      e.target.value = '';
+      if (!file) return;
+
+      setUploadError(null);
+      setDecodingUpload(true);
+      try {
+        const value = await decodeQrFromImageFile(file);
+        if (!value) {
+          setUploadError("Couldn't find a QR code in that image — try a clearer photo or crop closer to the code.");
+          return;
+        }
+        handleCode(value);
+      } catch {
+        setUploadError('Could not read that image file.');
+      } finally {
+        setDecodingUpload(false);
+      }
+    },
+    [handleCode]
   );
 
   const stop = useCallback(() => {
@@ -174,7 +250,18 @@ export default function QrScanner({ onScan, onCancel, busy, statusMessage }) {
         </div>
       )}
 
+      {/* Shared by both modes below — a one-shot action, not a mode of
+          its own, so it doesn't need a third branch in the toggle. */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        onChange={handleFileChange}
+        style={{ display: 'none' }}
+      />
+
       <Alert>{cameraError}</Alert>
+      <Alert>{uploadError}</Alert>
       {statusMessage && <Alert tone={statusMessage.tone}>{statusMessage.text}</Alert>}
 
       {manualMode ? (
@@ -191,7 +278,7 @@ export default function QrScanner({ onScan, onCancel, busy, statusMessage }) {
             placeholder="Paste the code from the customer's screen"
             autoFocus
           />
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap">
             <Button type="submit" disabled={busy || !manualValue.trim()}>
               Add to line
             </Button>
@@ -205,12 +292,27 @@ export default function QrScanner({ onScan, onCancel, busy, statusMessage }) {
             >
               <Camera size={14} /> Use camera
             </Button>
+            <Button
+              type="button"
+              variant="secondary"
+              disabled={decodingUpload}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              <Upload size={14} /> {decodingUpload ? 'Reading…' : 'Upload QR image'}
+            </Button>
           </div>
         </form>
       ) : (
-        <div className="flex gap-2">
+        <div className="flex gap-2 flex-wrap">
           <Button variant="secondary" onClick={() => setManualMode(true)}>
             <Keyboard size={14} /> Enter manually
+          </Button>
+          <Button
+            variant="secondary"
+            disabled={decodingUpload}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <Upload size={14} /> {decodingUpload ? 'Reading…' : 'Upload QR image'}
           </Button>
           <Button variant="secondary" onClick={onCancel}>
             <X size={14} /> Close

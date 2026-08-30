@@ -23,13 +23,31 @@ const {
   computeMove,
   GAP,
 } = require('./queueCore');
+const { sendPushToUser } = require('./push');
 
 const ACTIVE_STATUSES = ['waiting', 'serving'];
 
-/** Fetch the live, ordered queue for a venue: serving row (if any) first, then waiting rows by weight. Read-only, no lock. */
+/**
+ * Fetch the live, ordered queue for a venue: serving row (if any) first,
+ * then waiting rows by weight. Read-only, no lock.
+ *
+ * Deliberately NOT `SELECT *`: this result is what the staff dashboard's
+ * `GET /venues/:id/queue` returns verbatim as JSON. `last_lat`/`last_lng`
+ * are excluded on purpose — the product principle is that staff see
+ * presence STATE ("checked in" / "not checked in"), never a customer's
+ * raw coordinates, unless there's a specific reason to. The UI never
+ * rendered these columns, but the API response leaked them regardless
+ * (visible to anyone with devtools open on the staff console); this is
+ * the fix. Anything needing the raw coordinates server-side (the geofence
+ * check itself) reads them directly from the DB, not through this query.
+ */
 async function getLiveQueue(db, venueId) {
   const { rows } = await db.query(
-    `SELECT * FROM queue_entries
+    `SELECT id, venue_id, user_id, customer_name, customer_phone, status,
+            payment_tier, order_weight, is_checked_in, live_eta_minutes,
+            expected_slot_at, is_override_locked, last_automation_flag,
+            joined_at, updated_at
+       FROM queue_entries
       WHERE venue_id = $1 AND status = ANY($2::queue_status[])
       ORDER BY (status = 'serving') DESC, order_weight ASC`,
     [venueId, ACTIVE_STATUSES]
@@ -99,12 +117,59 @@ async function callNextCustomer(db, venueId, entryId) {
     }
 
     await client.query('COMMIT');
+
+    // Fire-and-forget, deliberately outside the transaction and not
+    // awaited by the caller: push delivery latency (or a misconfigured/
+    // unreachable provider) must never slow down or fail a "call next"
+    // action that has already committed successfully.
+    notifyAfterServe(db, sorted, result).catch((err) => console.error('[push] notifyAfterServe failed', err));
+
     return result;
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
   } finally {
     client.release();
+  }
+}
+
+/**
+ * The three moments callNextCustomer's own result can trigger a
+ * notification worth sending. `sorted` is the post-promotion queue
+ * (serving row first) reconstructed in callNextCustomer, which already
+ * carries every affected row's user_id — no extra query needed.
+ */
+async function notifyAfterServe(db, sorted, result) {
+  const nowServing = sorted[0];
+  if (nowServing?.user_id) {
+    await sendPushToUser(db, nowServing.user_id, {
+      title: "It's your turn",
+      body: `${nowServing.customer_name}, please head to the counter now.`,
+      tag: `qpinoy-turn-${nowServing.id}`,
+      url: '/',
+    });
+  }
+
+  const nextUp = sorted[1];
+  if (nextUp?.user_id && !nextUp.is_override_locked) {
+    await sendPushToUser(db, nextUp.user_id, {
+      title: "You're next",
+      body: 'Please start making your way back — you should be called shortly.',
+      tag: `qpinoy-next-${nextUp.id}`,
+      url: '/',
+    });
+  }
+
+  if (result.mutated && (result.reason === 'stepped_back' || result.reason === 'dropped')) {
+    const skipped = sorted.find((e) => e.id === result.targetId);
+    if (skipped?.user_id) {
+      await sendPushToUser(db, skipped.user_id, {
+        title: 'You were temporarily skipped',
+        body: "We couldn't confirm you were on the way, so we moved on — tap here when you're ready and we'll fit you back in.",
+        tag: `qpinoy-skipped-${skipped.id}`,
+        url: '/',
+      });
+    }
   }
 }
 
@@ -196,6 +261,19 @@ async function reinstateSlot(db, venueId, entryId) {
     }
 
     await client.query('COMMIT');
+
+    if (result.mutated) {
+      const target = queue.find((r) => r.id === entryId);
+      if (target?.user_id) {
+        sendPushToUser(db, target.user_id, {
+          title: 'Your spot is restored',
+          body: "You're guaranteed next in line — no need to check in again.",
+          tag: `qpinoy-reinstated-${target.id}`,
+          url: '/',
+        }).catch((err) => console.error('[push] reinstate notify failed', err));
+      }
+    }
+
     return result;
   } catch (err) {
     await client.query('ROLLBACK');
@@ -236,6 +314,28 @@ async function moveOneSlot(db, venueId, entryId, direction) {
   } finally {
     client.release();
   }
+}
+
+/**
+ * Attendant marks the currently-serving customer as a no-show, instead of
+ * silently letting the next `serve` call auto-complete them.
+ *
+ * Restricted to a row that is actually 'serving': a no-show is "I called
+ * this person and they didn't come," which only makes sense for whoever
+ * currently holds that slot. This is a single-statement conditional
+ * UPDATE, not a multi-row transaction, because nothing else in the queue
+ * needs to move — the slot simply becomes empty until the next `serve`
+ * call promotes someone into it.
+ */
+async function markNoShow(db, venueId, entryId) {
+  const { rows } = await db.query(
+    `UPDATE queue_entries SET status = 'no_show'
+      WHERE id = $1 AND venue_id = $2 AND status = 'serving'
+      RETURNING id`,
+    [entryId, venueId]
+  );
+  if (!rows[0]) return { mutated: false, reason: 'not_currently_serving' };
+  return { mutated: true, reason: 'no_show', targetId: entryId };
 }
 
 /** Small helper: persist a `{order_weight?, is_override_locked?, last_automation_flag?}` patch as one UPDATE. */
@@ -286,5 +386,6 @@ module.exports = {
   callNextCustomer,
   reinstateSlot,
   moveOneSlot,
+  markNoShow,
   rebalanceIfNeeded,
 };

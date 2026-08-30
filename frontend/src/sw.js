@@ -147,3 +147,52 @@ async function networkFirst(request) {
 self.addEventListener('message', (event) => {
   if (event.data === 'SKIP_WAITING') self.skipWaiting();
 });
+
+/**
+ * Web Push — the "pull, don't push" channel DEPLOYMENT.md (§4)
+ * recommended in place of trusting a phone's last stored location once
+ * its screen locks. The server (backend/push.js) decides WHEN to notify
+ * ("you're next," "you were skipped"); this worker's only job is to
+ * render whatever payload it sent and route a tap back into the app.
+ */
+self.addEventListener('push', (event) => {
+  let data = {};
+  try {
+    data = event.data ? event.data.json() : {};
+  } catch {
+    data = { title: 'QPinoy', body: event.data ? event.data.text() : '' };
+  }
+
+  const title = data.title || 'QPinoy';
+  const options = {
+    body: data.body || '',
+    icon: '/icons/icon-192.png',
+    badge: '/icons/icon-192.png',
+    // Same tag as a later notification about the SAME ticket replaces
+    // this one instead of stacking a duplicate — e.g. a fresh "you're
+    // next" shouldn't leave a stale "you're #3" notification sitting
+    // in the tray underneath it.
+    tag: data.tag || 'qpinoy',
+    data: { url: data.url || '/' },
+  };
+
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const url = event.notification.data?.url || '/';
+
+  event.waitUntil(
+    (async () => {
+      const allClients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      const existing = allClients.find((c) => c.url.startsWith(self.location.origin));
+      if (existing) {
+        await existing.focus();
+        if ('navigate' in existing) await existing.navigate(url);
+      } else {
+        await self.clients.openWindow(url);
+      }
+    })()
+  );
+});

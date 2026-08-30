@@ -20,6 +20,13 @@ const { isPlausibleCoordinate } = require('./geofence');
 
 const ASSIGNABLE_ROLES = ['attendant', 'manager'];
 
+// Bounds for venues.enrollment_qr_ttl_seconds (see schema.sql). Short
+// enough that a photographed check-in code stops being useful within
+// one visit; long enough to actually be a configurable knob rather than
+// a cosmetic one.
+const MIN_ENROLLMENT_QR_TTL_SECONDS = 60;
+const MAX_ENROLLMENT_QR_TTL_SECONDS = 3600;
+
 function buildVenueRouter(pool) {
   const router = express.Router();
 
@@ -29,7 +36,7 @@ function buildVenueRouter(pool) {
       const { rows } = await pool.query(
         `SELECT v.id, v.name, v.address, v.geofence_lat, v.geofence_lng,
                 v.geofence_radius_meters, v.avg_service_minutes,
-                v.is_automation_enabled, m.role
+                v.is_automation_enabled, v.enrollment_qr_ttl_seconds, m.role
            FROM venue_members m
            JOIN venues v ON v.id = m.venue_id
           WHERE m.user_id = $1
@@ -99,6 +106,32 @@ function buildVenueRouter(pool) {
     }
   });
 
+  /**
+   * Public venue info — no auth required. This is what a "join our line
+   * remotely" link/QR (e.g. printed at the front desk, or shared on the
+   * venue's own site or social page) resolves to before a customer signs
+   * in: enough to show them what they're joining and how busy it is, and
+   * nothing else. Deliberately excludes the staff roster, the exact
+   * geofence coordinates, and anything else that's the staff-only
+   * `GET /venues/:venueId` response.
+   */
+  router.get('/venues/:venueId/public', requireUuidParams('venueId'), async (req, res, next) => {
+    try {
+      const { rows } = await pool.query(
+        `SELECT v.id, v.name, v.address, v.avg_service_minutes,
+                (SELECT count(*)::int FROM queue_entries e
+                  WHERE e.venue_id = v.id AND e.status IN ('waiting', 'serving')) AS people_in_line
+           FROM venues v
+          WHERE v.id = $1`,
+        [req.params.venueId]
+      );
+      if (!rows[0]) return res.status(404).json({ error: 'venue not found' });
+      res.json({ venue: rows[0] });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   /** Venue detail — any staff member. */
   router.get(
     '/venues/:venueId',
@@ -110,6 +143,43 @@ function buildVenueRouter(pool) {
         const { rows } = await pool.query(`SELECT * FROM venues WHERE id = $1`, [req.params.venueId]);
         if (!rows[0]) return res.status(404).json({ error: 'venue not found' });
         res.json({ venue: { ...rows[0], role: req.venueRole } });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  /**
+   * How long a check-in QR requested FOR this venue stays valid — see
+   * the long comment on GET /me/enrollment-token in authRoutes.js for
+   * why this is venue-scoped even though the token itself isn't.
+   * Owner/manager only, same tier as the automation toggle and the
+   * staff list: this is an operational setting for running the line,
+   * not something an attendant needs to change mid-shift.
+   */
+  router.patch(
+    '/venues/:venueId/enrollment-qr-ttl',
+    requireUuidParams('venueId'),
+    requireAuth,
+    requireVenueRole(pool, STAFF_MANAGER_ROLES),
+    async (req, res, next) => {
+      const { ttlSeconds } = req.body || {};
+      if (
+        !Number.isInteger(ttlSeconds) ||
+        ttlSeconds < MIN_ENROLLMENT_QR_TTL_SECONDS ||
+        ttlSeconds > MAX_ENROLLMENT_QR_TTL_SECONDS
+      ) {
+        return res.status(400).json({
+          error: `ttlSeconds must be a whole number between ${MIN_ENROLLMENT_QR_TTL_SECONDS} and ${MAX_ENROLLMENT_QR_TTL_SECONDS}`,
+        });
+      }
+      try {
+        const { rows } = await pool.query(
+          `UPDATE venues SET enrollment_qr_ttl_seconds = $1, updated_at = now() WHERE id = $2 RETURNING enrollment_qr_ttl_seconds`,
+          [ttlSeconds, req.params.venueId]
+        );
+        if (!rows[0]) return res.status(404).json({ error: 'venue not found' });
+        res.json({ enrollment_qr_ttl_seconds: rows[0].enrollment_qr_ttl_seconds });
       } catch (err) {
         next(err);
       }

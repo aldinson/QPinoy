@@ -16,6 +16,7 @@ const {
   TokenError,
   PURPOSE_SESSION,
   PURPOSE_ENROLLMENT,
+  ENROLLMENT_TTL_SECONDS,
 } = require('./tokens');
 
 const USER_ID = '11111111-1111-1111-1111-111111111111';
@@ -30,6 +31,17 @@ test('an enrollment token verifies and is scoped to the enrollment purpose', () 
   const claims = verifyEnrollmentToken(createEnrollmentToken(USER_ID));
   assert.equal(claims.sub, USER_ID);
   assert.equal(claims.typ, PURPOSE_ENROLLMENT);
+});
+
+test('an enrollment token with no ttlSeconds override uses the system default (15 minutes)', () => {
+  const claims = verifyEnrollmentToken(createEnrollmentToken(USER_ID));
+  assert.equal(claims.exp - claims.iat, ENROLLMENT_TTL_SECONDS);
+  assert.equal(ENROLLMENT_TTL_SECONDS, 15 * 60);
+});
+
+test('an enrollment token respects an explicit ttlSeconds override (a venue-configured value)', () => {
+  const claims = verifyEnrollmentToken(createEnrollmentToken(USER_ID, 300));
+  assert.equal(claims.exp - claims.iat, 300);
 });
 
 test('SECURITY: an enrollment token cannot be replayed as a login session', () => {

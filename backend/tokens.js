@@ -38,13 +38,22 @@ const PURPOSE_SESSION = 'session';
  * Enrollment token — what a customer's phone renders as a QR code for
  * staff to scan. Deliberately short-lived: it is displayed on a screen
  * in public, so anyone standing behind the customer can photograph it.
- * 90 seconds means a stolen photo is worthless almost immediately, and
- * the customer's screen re-renders a fresh one well before expiry.
+ * A short TTL means a stolen photo goes stale fast, and the customer's
+ * screen re-renders a fresh one well before expiry either way.
+ *
+ * ENROLLMENT_TTL_SECONDS below is the SYSTEM-WIDE default (15 minutes —
+ * long enough that a slow-moving line doesn't force a customer to keep
+ * re-showing their screen, short enough that a photographed code still
+ * goes stale within one visit). A venue can configure its own value —
+ * see venues.enrollment_qr_ttl_seconds and the PATCH
+ * .../enrollment-qr-ttl route in venueRoutes.js — which authRoutes.js
+ * applies by passing an explicit `ttlSeconds` to createEnrollmentToken()
+ * instead of relying on this default.
  */
 const PURPOSE_ENROLLMENT = 'enroll';
 
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
-const ENROLLMENT_TTL_SECONDS = 90;
+const ENROLLMENT_TTL_SECONDS = 15 * 60;
 
 class TokenError extends Error {
   constructor(message, reason) {
@@ -153,7 +162,8 @@ function verifyToken(token, expectedPurpose) {
 const createSessionToken = (userId) => createToken({ sub: userId }, PURPOSE_SESSION, SESSION_TTL_SECONDS);
 const verifySessionToken = (token) => verifyToken(token, PURPOSE_SESSION);
 
-const createEnrollmentToken = (userId) => createToken({ sub: userId }, PURPOSE_ENROLLMENT, ENROLLMENT_TTL_SECONDS);
+const createEnrollmentToken = (userId, ttlSeconds = ENROLLMENT_TTL_SECONDS) =>
+  createToken({ sub: userId }, PURPOSE_ENROLLMENT, ttlSeconds);
 const verifyEnrollmentToken = (token) => verifyToken(token, PURPOSE_ENROLLMENT);
 
 module.exports = {

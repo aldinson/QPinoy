@@ -26,7 +26,13 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto"; -- gen_random_uuid()
 -- ---------------------------------------------------------
 -- ENUM TYPES
 -- ---------------------------------------------------------
-CREATE TYPE queue_status AS ENUM ('waiting', 'serving', 'served', 'dropped', 'cancelled');
+-- 'no_show' is distinct from 'served': it means an attendant called this
+-- customer and they never appeared, as opposed to actually being attended
+-- to. Conflating the two (the original bug: callNextCustomer auto-marked
+-- whoever was previously 'serving' as 'served' with no way to say
+-- otherwise) silently corrupts service-time and no-show-rate analytics.
+-- See markNoShow() in queueEngine.js.
+CREATE TYPE queue_status AS ENUM ('waiting', 'serving', 'served', 'dropped', 'cancelled', 'no_show');
 CREATE TYPE payment_tier AS ENUM ('standard_free', 'premium_secured');
 CREATE TYPE automation_flag AS ENUM ('stepped_back', 'dropped', 'reinstated');
 
@@ -94,6 +100,19 @@ CREATE TABLE venues (
     -- automation trigger is a no-op and the dashboard falls back to
     -- manual attendant reordering.
     is_automation_enabled   BOOLEAN NOT NULL DEFAULT TRUE,
+    -- How long a customer's check-in QR (see tokens.js's enrollment
+    -- token) stays valid before it expires and the customer's screen
+    -- silently re-fetches a fresh one, WHEN that token was requested in
+    -- this venue's context (GET /me/enrollment-token?venueId=...).
+    -- Owner/manager-configurable — see PATCH .../enrollment-qr-ttl in
+    -- venueRoutes.js. Bounded in application code (60-3600s): short
+    -- enough that a photographed code stops being useful reasonably
+    -- fast, long enough to actually be configurable and not just a
+    -- cosmetic knob. A customer's enrollment token is otherwise
+    -- venue-agnostic (any venue's staff can scan it), so this setting
+    -- only takes effect when the token was requested WITH this venue in
+    -- mind — see authRoutes.js.
+    enrollment_qr_ttl_seconds INTEGER NOT NULL DEFAULT 900,
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -214,6 +233,32 @@ CREATE UNIQUE INDEX idx_one_active_entry_per_user_per_venue
     WHERE user_id IS NOT NULL AND status IN ('waiting', 'serving');
 
 -- ---------------------------------------------------------
+-- PUSH SUBSCRIPTIONS — Web Push registrations, one row per browser/device
+-- a customer has enabled notifications on. See backend/push.js.
+--
+-- This is the "pull, don't push" channel DEPLOYMENT.md (§4) recommended
+-- instead of trusting a phone's last stored location once its screen
+-- locks: the queue engine pushes a notification at the exact moment it
+-- matters (their turn is close, or they were skipped), and the tap
+-- itself is a fresh presence signal, not a stale GPS fix.
+-- ---------------------------------------------------------
+CREATE TABLE push_subscriptions (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    -- The PushSubscription's endpoint URL IS the natural unique key —
+    -- one per browser/device registration. A user with several devices
+    -- (phone + laptop) gets several rows and is notified on all of them.
+    endpoint    TEXT NOT NULL UNIQUE,
+    p256dh      TEXT NOT NULL,
+    auth        TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- "Every device this user should be notified on" — the query
+-- sendPushToUser() runs on every queue-state notification.
+CREATE INDEX idx_push_subscriptions_user ON push_subscriptions (user_id);
+
+-- ---------------------------------------------------------
 -- RATE LIMITS — fixed-window counters, shared across instances.
 --
 -- Deliberately in Postgres rather than in process memory. The
@@ -228,7 +273,21 @@ CREATE UNIQUE INDEX idx_one_active_entry_per_user_per_venue
 -- pings) already query this same database anyway.
 --
 -- IF NOT EXISTS so this block can be pasted straight into an already-
--- deployed database without re-running the whole schema.
+-- deployed database without re-running the whole schema. The same goes
+-- for push_subscriptions above, if upgrading a database created before
+-- it existed:
+--
+--   ALTER TABLE venues ADD COLUMN IF NOT EXISTS enrollment_qr_ttl_seconds INTEGER NOT NULL DEFAULT 900;
+--
+--   CREATE TABLE IF NOT EXISTS push_subscriptions (
+--       id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+--       user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+--       endpoint    TEXT NOT NULL UNIQUE,
+--       p256dh      TEXT NOT NULL,
+--       auth        TEXT NOT NULL,
+--       created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+--   );
+--   CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions (user_id);
 -- ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS rate_limits (
     -- 'purpose:dimension:<sha256 of the identifier>' — see rateLimit.js.
@@ -243,6 +302,16 @@ CREATE TABLE IF NOT EXISTS rate_limits (
 
 -- Supports the housekeeping sweep that drops long-finished windows.
 CREATE INDEX IF NOT EXISTS idx_rate_limits_window_start ON rate_limits (window_start);
+
+-- ---------------------------------------------------------
+-- Upgrading a database that already exists: add the 'no_show' enum value
+-- (added after initial release — see the comment above queue_status).
+-- ALTER TYPE ... ADD VALUE cannot run inside a multi-statement transaction
+-- block on older Postgres, so run this line on its own against an
+-- already-deployed database instead of re-running the whole schema:
+--
+--   ALTER TYPE queue_status ADD VALUE IF NOT EXISTS 'no_show';
+-- ---------------------------------------------------------
 
 -- ---------------------------------------------------------
 -- updated_at auto-touch (housekeeping, not core queue logic)

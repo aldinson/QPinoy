@@ -14,7 +14,7 @@
  */
 
 const express = require('express');
-const { getLiveQueue, joinQueue, callNextCustomer, reinstateSlot, moveOneSlot, rebalanceIfNeeded } = require('./queueEngine');
+const { getLiveQueue, joinQueue, callNextCustomer, reinstateSlot, moveOneSlot, markNoShow, rebalanceIfNeeded } = require('./queueEngine');
 const { isWithinGeofence, isPlausibleCoordinate } = require('./geofence');
 const { getLiveEtaMinutes } = require('./distanceMatrixClient');
 const { requireAuth, requireVenueRole, requireUuidParams, STAFF_ROLES } = require('./auth');
@@ -103,6 +103,50 @@ function buildQueueRouter(pool) {
   });
 
   /**
+   * Self-service remote join: a signed-in customer adds THEMSELVES to a
+   * venue's line, with no staff scan involved. This is what a shareable
+   * "join our line" link/QR (`GET /venues/:id/public` resolves it)
+   * ultimately does — it's the "virtual waiting room" entry point that
+   * complements (not replaces) the staff-scan enrollment above.
+   *
+   * Deliberately NOT staff-gated — that's the whole point — but still
+   * requires a real signed-in account (so a name and phone number are on
+   * file, and the one-ticket-per-venue constraint applies), and always
+   * joins at the standard/free tier: a premium/deposit slot is not
+   * something a customer can grant themselves without staff (or a real
+   * payment flow, which doesn't exist yet) involved.
+   */
+  const selfJoinRateLimit = rateLimitMiddleware(pool, {
+    ...LIMITS.SELF_JOIN,
+    key: (req) => (req.user ? bucketKey('self_join', 'user', req.user.id) : null),
+    message: 'too many join attempts — slow down and try again shortly',
+  });
+
+  router.post(
+    '/venues/:venueId/queue/join',
+    requireUuidParams('venueId'),
+    requireAuth,
+    selfJoinRateLimit,
+    async (req, res, next) => {
+      try {
+        const result = await joinQueue(pool, req.params.venueId, {
+          customerName: req.user.full_name,
+          customerPhone: req.user.phone,
+          paymentTier: 'standard_free',
+          userId: req.user.id,
+        });
+        if (result.reason === 'already_in_queue') {
+          return res.status(409).json({ error: 'you are already in this line' });
+        }
+        if (!result.mutated) return res.status(404).json({ error: 'venue not found' });
+        res.status(201).json({ entry: result.entry });
+      } catch (err) {
+        next(err);
+      }
+    }
+  );
+
+  /**
    * Add a walk-in by name — someone with no QPinoy account at all.
    * Still staff-only, and the resulting row has no `user_id`, so that
    * customer can't later claim it or update their own location. Kept
@@ -139,6 +183,20 @@ function buildQueueRouter(pool) {
   router.post('/venues/:venueId/queue/:entryId/serve', staffOnly, async (req, res, next) => {
     try {
       const result = await callNextCustomer(pool, req.params.venueId, req.params.entryId);
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Attendant marks the currently-serving customer a no-show — distinct
+  // from just calling the next customer, which would otherwise silently
+  // record this person as 'served'. Use this BEFORE calling next when the
+  // called customer never showed up.
+  router.post('/venues/:venueId/queue/:entryId/no-show', staffOnly, async (req, res, next) => {
+    try {
+      const result = await markNoShow(pool, req.params.venueId, req.params.entryId);
+      if (!result.mutated) return res.status(409).json({ error: 'that customer is not currently being served' });
       res.json(result);
     } catch (err) {
       next(err);
