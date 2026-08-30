@@ -22,6 +22,7 @@ import {
   Copy,
   Check,
   Settings,
+  Receipt,
 } from 'lucide-react';
 import { COLORS, FONT_MONO, FONT_SANS } from './theme';
 import { api } from './api';
@@ -71,6 +72,47 @@ function isAtRiskClient(entry, now = Date.now()) {
   if (entry.is_checked_in) return false;
   if (entry.live_eta_minutes == null || entry.expected_slot_at == null) return false;
   return now + entry.live_eta_minutes * 60000 > new Date(entry.expected_slot_at).getTime();
+}
+
+/**
+ * Mirrors backend/subscriptions.js's getSubscriptionState() — same
+ * "hand-port the pure rule to the client so the banner doesn't need an
+ * extra request" reasoning as isAtRiskClient above. Only computes what
+ * the banner actually needs; the full Billing.jsx screen gets the
+ * authoritative version straight from GET /venues/:id/billing.
+ */
+function subscriptionStateClient(venue, now = Date.now()) {
+  const hasEverPaid = venue.subscription_paid_until != null;
+  const coverageEnd = new Date(hasEverPaid ? venue.subscription_paid_until : venue.trial_ends_at).getTime();
+  const daysLeft = Math.ceil((coverageEnd - now) / (24 * 60 * 60 * 1000));
+  return { isPastDue: now >= coverageEnd, isTrialing: !hasEverPaid, daysLeft };
+}
+
+/** Nudges owner/manager toward Billing before it becomes a problem — trial ending soon, or already past due. Renders nothing otherwise. */
+function SubscriptionBanner({ venue, canManageStaff, navigate }) {
+  if (!venue) return null;
+  const state = subscriptionStateClient(venue);
+  if (!state.isPastDue && !(state.isTrialing && state.daysLeft <= 3)) return null;
+
+  return (
+    <button
+      onClick={() => canManageStaff && navigate(`/billing?venue=${venue.id}`)}
+      className="w-full text-left rounded-xl px-3.5 py-2.5 mb-4 flex items-center gap-2"
+      style={{
+        backgroundColor: state.isPastDue ? `${COLORS.rust}22` : `${COLORS.brass}22`,
+        border: `1px solid ${state.isPastDue ? COLORS.rust : COLORS.brass}55`,
+        cursor: canManageStaff ? 'pointer' : 'default',
+      }}
+    >
+      <AlertTriangle size={14} color={state.isPastDue ? COLORS.rust : COLORS.brass} />
+      <span className="text-xs font-semibold" style={{ color: state.isPastDue ? COLORS.rust : COLORS.brass }}>
+        {state.isPastDue
+          ? "Subscription needs renewal — new customers can't join until then."
+          : `Trial ends in ${state.daysLeft} ${state.daysLeft === 1 ? 'day' : 'days'}.`}
+        {canManageStaff ? ' Tap to manage billing.' : ' Ask an owner/manager to renew.'}
+      </span>
+    </button>
+  );
 }
 
 /**
@@ -322,6 +364,8 @@ export default function AttendantDashboard({ venueId, navigate }) {
   const [walkInPhone, setWalkInPhone] = useState('');
   const [walkInTier, setWalkInTier] = useState('standard_free');
 
+  const [billingEnabled, setBillingEnabled] = useState(false);
+
   const load = useCallback(async () => {
     try {
       const { queue: rows } = await api.getQueue(venueId);
@@ -343,6 +387,17 @@ export default function AttendantDashboard({ venueId, navigate }) {
       .then(({ venue: v }) => setVenue(v))
       .catch(() => {});
   }, [venueId]);
+
+  // Feature flag, not per-venue — fetched once. Keeps the Billing
+  // button and trial/past-due banner hidden entirely while
+  // SUBSCRIPTION_ENABLE is off, rather than showing UI for a feature
+  // that isn't live yet.
+  useEffect(() => {
+    api
+      .getBillingConfig()
+      .then(({ enabled }) => setBillingEnabled(enabled))
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     load();
@@ -441,6 +496,7 @@ export default function AttendantDashboard({ venueId, navigate }) {
         </header>
 
         <Alert>{error}</Alert>
+        {billingEnabled && <SubscriptionBanner venue={venue} canManageStaff={canManageStaff} navigate={navigate} />}
 
         {/* Scanning is the primary way customers join, so it gets the
             primary button and sits above the line itself. */}
@@ -458,6 +514,11 @@ export default function AttendantDashboard({ venueId, navigate }) {
             {canManageStaff && (
               <Button variant="secondary" onClick={() => setShowQrSettings((v) => !v)}>
                 <Settings size={14} /> QR settings
+              </Button>
+            )}
+            {canManageStaff && billingEnabled && (
+              <Button variant="secondary" onClick={() => navigate(`/billing?venue=${venueId}`)}>
+                <Receipt size={14} /> Billing
               </Button>
             )}
             {canManageStaff && (

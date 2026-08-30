@@ -20,6 +20,52 @@ const { getLiveEtaMinutes } = require('./distanceMatrixClient');
 const { requireAuth, requireVenueRole, requireUuidParams, STAFF_ROLES } = require('./auth');
 const { verifyEnrollmentToken, TokenError } = require('./tokens');
 const { LIMITS, bucketKey, clientIp, rateLimitMiddleware } = require('./rateLimit');
+const { getSubscriptionState, isEnabled: isSubscriptionEnabled } = require('./subscriptions');
+
+/**
+ * Blocks bringing NEW customers into a venue's line once its
+ * subscription has lapsed (trial over, nothing paid since) — applied
+ * only to the three join routes below, deliberately nowhere else.
+ *
+ * What it does NOT touch, on purpose: calling next, no-show, reinstate,
+ * move, or the location ping. Someone already standing in a lapsed
+ * venue's line is not that customer's problem to eat, and stranding
+ * them mid-service to make a billing point would be real collateral
+ * damage for zero benefit — the venue already can't grow its line
+ * further, which is the actual lever that matters.
+ *
+ * A no-op entirely while the feature's master switch
+ * (subscriptions.isEnabled(), SUBSCRIPTION_ENABLE) is off — the default
+ * — so no venue is ever blocked by a feature that isn't live yet, and
+ * no query runs for a check that would always pass anyway.
+ *
+ * Fails OPEN on a DB error, same reasoning as rateLimit.js: a transient
+ * outage must not lock a paying, ACTIVE venue out of taking customers
+ * just because the one query that would have proven that failed.
+ */
+function requireActiveSubscription(pool) {
+  return async (req, res, next) => {
+    if (!isSubscriptionEnabled()) return next();
+    try {
+      const { rows } = await pool.query(
+        `SELECT trial_ends_at, subscription_paid_until FROM venues WHERE id = $1`,
+        [req.params.venueId]
+      );
+      if (!rows[0]) return next(); // let the route's own venue lookup produce the 404 — no need to duplicate that here
+      const { isUsable } = getSubscriptionState(rows[0]);
+      if (!isUsable) {
+        return res.status(402).json({
+          error: "this venue's QPinoy subscription needs to be renewed before new customers can join",
+          reason: 'subscription_past_due',
+        });
+      }
+      next();
+    } catch (err) {
+      console.error('[billing] subscription check unavailable, allowing the join', err);
+      next();
+    }
+  };
+}
 
 function buildQueueRouter(pool) {
   const router = express.Router();
@@ -27,6 +73,7 @@ function buildQueueRouter(pool) {
   // Applied per-route below rather than router-wide, because the
   // location ping needs a different rule than "must be staff here".
   const staffOnly = [requireUuidParams('venueId'), requireAuth, requireVenueRole(pool, STAFF_ROLES)];
+  const activeSubscription = requireActiveSubscription(pool);
 
   // GET the live line for a venue, already in serve order.
   router.get('/venues/:venueId/queue', staffOnly, async (req, res, next) => {
@@ -51,7 +98,7 @@ function buildQueueRouter(pool) {
    * in the body — otherwise any staff member could enroll any user in
    * the system by guessing IDs.
    */
-  router.post('/venues/:venueId/queue/enroll', staffOnly, async (req, res, next) => {
+  router.post('/venues/:venueId/queue/enroll', [...staffOnly, activeSubscription], async (req, res, next) => {
     const { enrollmentToken, paymentTier } = req.body || {};
     if (typeof enrollmentToken !== 'string' || !enrollmentToken) {
       return res.status(400).json({ error: 'enrollmentToken is required' });
@@ -127,6 +174,7 @@ function buildQueueRouter(pool) {
     requireUuidParams('venueId'),
     requireAuth,
     selfJoinRateLimit,
+    activeSubscription,
     async (req, res, next) => {
       try {
         const result = await joinQueue(pool, req.params.venueId, {
@@ -153,7 +201,7 @@ function buildQueueRouter(pool) {
    * because a real front desk cannot turn away the person who doesn't
    * have the app.
    */
-  router.post('/venues/:venueId/queue', staffOnly, async (req, res, next) => {
+  router.post('/venues/:venueId/queue', [...staffOnly, activeSubscription], async (req, res, next) => {
     const { customerName, customerPhone, paymentTier } = req.body || {};
     if (typeof customerName !== 'string' || !customerName.trim()) {
       return res.status(400).json({ error: 'body.customerName is required' });

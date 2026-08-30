@@ -8,6 +8,8 @@ import JoinVenue from './JoinVenue';
 import VenueSetup from './VenueSetup';
 import AttendantDashboard from './AttendantDashboard';
 import StaffMembers from './StaffMembers';
+import Billing from './Billing';
+import BillingReturn from './BillingReturn';
 import QueueSimulator from './QueueSimulator';
 import InstallPrompt from './InstallPrompt';
 import { Screen, Card, Button } from './ui';
@@ -181,6 +183,25 @@ function Routes() {
     const allowed = memberships.some((m) => m.venue_id === venueId);
     if (!allowed) return <Home navigate={navigate} />;
     return <StaffMembers venueId={venueId} navigate={navigate} />;
+  }
+
+  if (loc.path === '/billing') {
+    const venueId = params.get('venue');
+    const allowed = memberships.some((m) => m.venue_id === venueId);
+    if (!allowed) return <Home navigate={navigate} />;
+    // The cancel_url billingRoutes.js builds carries the abandoned
+    // payment's id as `cancelled` so Billing.jsx can mark that row
+    // cancelled instead of leaving it 'pending' forever.
+    return <Billing venueId={venueId} cancelledPaymentId={params.get('cancelled')} navigate={navigate} />;
+  }
+
+  if (loc.path === '/billing/return') {
+    const venueId = params.get('venue');
+    const paymentId = params.get('payment');
+    const provider = params.get('provider');
+    const allowed = memberships.some((m) => m.venue_id === venueId);
+    if (!allowed || !paymentId || !provider) return <Home navigate={navigate} />;
+    return <BillingReturn venueId={venueId} paymentId={paymentId} provider={provider} navigate={navigate} />;
   }
 
   return <Home navigate={navigate} />;

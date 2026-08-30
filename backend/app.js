@@ -16,6 +16,7 @@ const express = require('express');
 const { buildQueueRouter } = require('./routes');
 const { buildAuthRouter } = require('./authRoutes');
 const { buildVenueRouter } = require('./venueRoutes');
+const { buildBillingRouter } = require('./billingRoutes');
 const { attachUser } = require('./auth');
 
 /**
@@ -65,7 +66,14 @@ function createApp(pool) {
   // platform's own address into a single shared counter.
   if (process.env.TRUST_PROXY) app.set('trust proxy', 1);
 
-  app.use(express.json());
+  // The `verify` callback stashes the exact bytes of every request body
+  // on req.rawBody BEFORE they're parsed into req.body. Needed for
+  // exactly one thing — billingRoutes.js's PayMongo webhook handler,
+  // which has to HMAC-verify the raw byte sequence PayMongo signed, not
+  // a re-serialization of the parsed object (key order and whitespace
+  // would never match). Cheap enough to do unconditionally for every
+  // route rather than special-casing the webhook path's middleware order.
+  app.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
   app.use(corsMiddleware());
 
   app.get('/health', (req, res) => res.json({ ok: true }));
@@ -80,6 +88,7 @@ function createApp(pool) {
   // matched before anything that would treat 'mine' as a :venueId.
   app.use('/api', buildVenueRouter(pool));
   app.use('/api', buildQueueRouter(pool));
+  app.use('/api', buildBillingRouter(pool));
 
   // Centralized error handler — keep internals out of the response body.
   // eslint-disable-next-line no-unused-vars

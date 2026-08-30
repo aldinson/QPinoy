@@ -113,6 +113,24 @@ CREATE TABLE venues (
     -- only takes effect when the token was requested WITH this venue in
     -- mind — see authRoutes.js.
     enrollment_qr_ttl_seconds INTEGER NOT NULL DEFAULT 900,
+
+    -- Subscription state — see subscriptions.js for the full reasoning.
+    -- Deliberately just two timestamps, no stored status enum: a
+    -- venue's effective status (trialing/active/past_due) is always
+    -- COMPUTED from these against now(), never cached, so there's no
+    -- background job required to "expire" anything and no risk of
+    -- stale status from a missed cron run.
+    --
+    --   trial_ends_at             set once at creation (14 days out).
+    --                             Ignored forever once a payment lands.
+    --   subscription_paid_until   NULL until the first successful
+    --                             payment; from then on this alone
+    --                             determines coverage. Extended by
+    --                             subscriptions.js's computeNewPeriodEnd()
+    --                             on every successful checkout.
+    trial_ends_at              TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '14 days'),
+    subscription_paid_until    TIMESTAMPTZ,
+
     created_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at              TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -259,6 +277,62 @@ CREATE TABLE push_subscriptions (
 CREATE INDEX idx_push_subscriptions_user ON push_subscriptions (user_id);
 
 -- ---------------------------------------------------------
+-- SUBSCRIPTION PAYMENTS — one row per checkout attempt (GCash, Maya, or
+-- card via PayMongo; PayPal separately), an audit trail, and the
+-- correlation table a webhook uses to find the pending payment it's
+-- confirming. See backend/paymongo.js, backend/paypal.js,
+-- backend/billingRoutes.js.
+--
+-- A row starts 'pending' the instant a checkout session/order is
+-- created (before the payer has done anything), and is flipped to
+-- 'paid' by whichever confirms first — the payer's browser returning
+-- to the app (PayPal's capture-on-return; PayMongo has no equivalent
+-- synchronous step) or the provider's webhook — whichever wins the
+-- race. Both paths are idempotent: see the unique index below and the
+-- "already paid, no-op" checks in billingRoutes.js.
+-- ---------------------------------------------------------
+CREATE TYPE payment_provider AS ENUM ('paymongo', 'paypal');
+CREATE TYPE subscription_payment_status AS ENUM ('pending', 'paid', 'failed', 'cancelled');
+
+CREATE TABLE subscription_payments (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    venue_id             UUID NOT NULL REFERENCES venues(id) ON DELETE CASCADE,
+    provider             payment_provider NOT NULL,
+    -- PayMongo checkout_session id, or PayPal order id. NOT NULL —
+    -- there is no legitimate row without a provider reference, because
+    -- the row is only ever created immediately after that provider call
+    -- succeeds (see billingRoutes.js — a failed create-checkout call
+    -- never gets this far).
+    provider_reference   TEXT NOT NULL,
+    amount_centavos      INTEGER NOT NULL,
+    status               subscription_payment_status NOT NULL DEFAULT 'pending',
+    -- What this specific payment bought, computed once at checkout
+    -- creation time via subscriptions.computeNewPeriodEnd() — recorded
+    -- here (not just recomputed later from venues.subscription_paid_until)
+    -- so the billing history in the UI can show what each past payment
+    -- actually covered, even after later payments moved the venue's
+    -- current coverage further out.
+    period_start         TIMESTAMPTZ NOT NULL,
+    period_end           TIMESTAMPTZ NOT NULL,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    paid_at              TIMESTAMPTZ
+);
+
+-- One row per (provider, provider_reference): a webhook that fires
+-- twice for the same event (both providers document this as expected,
+-- not a bug — "at least once" delivery) must not extend a venue's
+-- coverage twice. billingRoutes.js's webhook handlers look the row up
+-- by this pair and no-op if it's already 'paid'.
+CREATE UNIQUE INDEX idx_subscription_payments_provider_ref
+    ON subscription_payments (provider, provider_reference);
+
+-- "This venue's billing history" — the query the Billing screen runs.
+CREATE INDEX idx_subscription_payments_venue ON subscription_payments (venue_id, created_at DESC);
+-- Its updated_at trigger is created below, alongside the other tables'
+-- (touch_updated_at() isn't defined until then).
+
+-- ---------------------------------------------------------
 -- RATE LIMITS — fixed-window counters, shared across instances.
 --
 -- Deliberately in Postgres rather than in process memory. The
@@ -288,6 +362,28 @@ CREATE INDEX idx_push_subscriptions_user ON push_subscriptions (user_id);
 --       created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 --   );
 --   CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions (user_id);
+--
+--   ALTER TABLE venues ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMPTZ NOT NULL DEFAULT (now() + interval '14 days');
+--   ALTER TABLE venues ADD COLUMN IF NOT EXISTS subscription_paid_until TIMESTAMPTZ;
+--
+--   CREATE TYPE payment_provider AS ENUM ('paymongo', 'paypal');
+--   CREATE TYPE subscription_payment_status AS ENUM ('pending', 'paid', 'failed', 'cancelled');
+--   CREATE TABLE IF NOT EXISTS subscription_payments (
+--       id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+--       venue_id           UUID NOT NULL REFERENCES venues(id) ON DELETE CASCADE,
+--       provider           payment_provider NOT NULL,
+--       provider_reference TEXT NOT NULL,
+--       amount_centavos    INTEGER NOT NULL,
+--       status             subscription_payment_status NOT NULL DEFAULT 'pending',
+--       period_start       TIMESTAMPTZ NOT NULL,
+--       period_end         TIMESTAMPTZ NOT NULL,
+--       created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+--       updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+--       paid_at            TIMESTAMPTZ
+--   );
+--   CREATE UNIQUE INDEX IF NOT EXISTS idx_subscription_payments_provider_ref ON subscription_payments (provider, provider_reference);
+--   CREATE INDEX IF NOT EXISTS idx_subscription_payments_venue ON subscription_payments (venue_id, created_at DESC);
+--   CREATE TRIGGER trg_touch_subscription_payments BEFORE UPDATE ON subscription_payments FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 -- ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS rate_limits (
     -- 'purpose:dimension:<sha256 of the identifier>' — see rateLimit.js.
@@ -337,6 +433,10 @@ FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 
 CREATE TRIGGER trg_touch_venue_members
 BEFORE UPDATE ON venue_members
+FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
+
+CREATE TRIGGER trg_touch_subscription_payments
+BEFORE UPDATE ON subscription_payments
 FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 
 -- ---------------------------------------------------------

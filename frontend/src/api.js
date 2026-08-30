@@ -128,6 +128,17 @@ export const api = {
   setAutomation: (venueId, enabled) => request('PATCH', `/venues/${venueId}/automation`, { enabled }),
   pingLocation: (venueId, entryId, lat, lng) => request('PATCH', `/venues/${venueId}/queue/${entryId}/location`, { lat, lng }),
   rebalance: (venueId) => request('POST', `/venues/${venueId}/rebalance`),
+
+  // ── Billing ─────────────────────────────────────────────────
+  // No auth required — a feature flag, not a secret. Lets the console
+  // decide whether to show any billing UI at all before it knows which
+  // venue (or whether the visitor is even signed in) it's dealing with.
+  getBillingConfig: () => request('GET', '/billing/config'),
+  getBilling: (venueId) => request('GET', `/venues/${venueId}/billing`),
+  startCheckout: (venueId, provider) => request('POST', `/venues/${venueId}/billing/checkout`, { provider }),
+  getBillingPayment: (venueId, paymentId) => request('GET', `/venues/${venueId}/billing/payments/${paymentId}`),
+  capturePaypalPayment: (venueId, paymentId) => request('POST', `/venues/${venueId}/billing/paypal/capture`, { paymentId }),
+  cancelBillingPayment: (venueId, paymentId) => request('POST', `/venues/${venueId}/billing/payments/${paymentId}/cancel`),
 };
 
 export { ApiError };
