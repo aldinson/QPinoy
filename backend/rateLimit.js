@@ -213,12 +213,25 @@ function rateLimitMiddleware(pool, { limit, windowSeconds, key, message }) {
  *                  is ~7x headroom for retries and clock skew while
  *                  still refusing a tight loop.
  *
- *  SELF_JOIN     — 5 remote joins per user per hour, across all venues.
- *                  The one-active-ticket-per-venue DB constraint already
- *                  stops rejoining the SAME venue while a ticket is
- *                  live; this catches a script hitting many DIFFERENT
- *                  venues' join links back to back, which that
- *                  constraint can't see.
+ *  SELF_JOIN     — 15 SUCCESSFUL remote joins per user per hour, across
+ *                  all venues. The one-active-ticket-per-venue DB
+ *                  constraint already stops rejoining the SAME venue
+ *                  while a ticket is live; this catches a script
+ *                  hitting many DIFFERENT venues' join links back to
+ *                  back, which that constraint can't see.
+ *
+ *      Counted on success only — see selfJoinBudget in routes.js.
+ *      Refused attempts (already in that line, venue lapsed, venue
+ *      gone) accomplish nothing for an attacker, so charging them to
+ *      the budget only ever punished the honest user.
+ *
+ *      Was 5, which turned out to be below real usage rather than
+ *      above it: someone browsing the venue directory and joining a
+ *      few lines hit the wall having done nothing wrong. 15 still
+ *      bounds the grinding case this exists for, and the actual
+ *      backstop there was never the counter anyway — one ticket per
+ *      venue per account caps the damage at a single bogus slot, which
+ *      staff clear with the no-show button.
  *
 
  * Known gap, stated rather than papered over: an attacker with many
@@ -231,7 +244,7 @@ const LIMITS = {
   LOGIN_ACCOUNT: { limit: 10, windowSeconds: 15 * 60 },
   LOGIN_IP: { limit: 60, windowSeconds: 15 * 60 },
   LOCATION: { limit: 30, windowSeconds: 60 },
-  SELF_JOIN: { limit: 5, windowSeconds: 60 * 60 },
+  SELF_JOIN: { limit: 15, windowSeconds: 60 * 60 },
 };
 
 module.exports = {

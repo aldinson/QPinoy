@@ -60,7 +60,7 @@ if (!process.env.DATABASE_URL) {
     // behind that make the NEXT run start above zero — the suite has
     // to be re-runnable without a manual database reset.
     await pool.query(
-      `DELETE FROM rate_limits WHERE bucket LIKE 'login:%' OR bucket LIKE 'location:%' OR bucket LIKE 'test:%'`
+      `DELETE FROM rate_limits WHERE bucket LIKE 'login:%' OR bucket LIKE 'location:%' OR bucket LIKE 'self_join:%' OR bucket LIKE 'test:%'`
     );
   }
 
@@ -340,5 +340,69 @@ if (!process.env.DATABASE_URL) {
       body: { lat: 1, lng: 1 },
     });
     assert.equal(status, 401);
+  });
+
+  // ── Remote self-join ─────────────────────────────────────────
+
+  async function createVenue(token, name) {
+    const { status, body } = await api('POST', '/api/venues', {
+      token,
+      body: { name, geofenceLat: 40.0, geofenceLng: -74.0, geofenceRadiusMeters: 150 },
+    });
+    assert.equal(status, 201, `createVenue failed: ${JSON.stringify(body)}`);
+    return body.venue;
+  }
+
+  test('a REFUSED join does not spend self-join budget', async () => {
+    // The regression this exists for: attempts used to be counted
+    // before the handler ran, so re-tapping Join on a line you are
+    // already in burned the hourly budget without ever adding you to
+    // anything. Five taps and an honest customer was locked out.
+    const owner = await register('sjowner', 'business');
+    const customer = await register('sjcustomer');
+    const venue = await createVenue(owner.token, 'Self Join Venue');
+    const bucket = bucketKey('self_join', 'user', customer.user.id);
+
+    const first = await api('POST', `/api/venues/${venue.id}/queue/join`, { token: customer.token });
+    assert.equal(first.status, 201);
+    assert.equal((await peek(pool, bucket, LIMITS.SELF_JOIN.windowSeconds)).hits, 1);
+
+    // Already in that line — refused, and must stay free.
+    for (let i = 0; i < 3; i += 1) {
+      const again = await api('POST', `/api/venues/${venue.id}/queue/join`, { token: customer.token });
+      assert.equal(again.status, 409);
+    }
+    assert.equal(
+      (await peek(pool, bucket, LIMITS.SELF_JOIN.windowSeconds)).hits,
+      1,
+      'refused joins must not consume the budget'
+    );
+
+    // A join against a venue that does not exist is refused too, and
+    // is likewise free.
+    const missing = await api('POST', '/api/venues/00000000-0000-0000-0000-000000000000/queue/join', {
+      token: customer.token,
+    });
+    assert.equal(missing.status, 404);
+    assert.equal((await peek(pool, bucket, LIMITS.SELF_JOIN.windowSeconds)).hits, 1);
+  });
+
+  test('successful joins do spend budget, and the hourly limit still refuses past it', async () => {
+    const customer = await register('sjlimit');
+    const bucket = bucketKey('self_join', 'user', customer.user.id);
+
+    // Spend the whole budget directly rather than standing up 15
+    // venues — the boundary is what matters here, not the arithmetic
+    // getting there.
+    for (let i = 0; i < LIMITS.SELF_JOIN.limit; i += 1) {
+      await record(pool, bucket, LIMITS.SELF_JOIN.windowSeconds);
+    }
+
+    const owner = await register('sjlimitowner', 'business');
+    const venue = await createVenue(owner.token, 'Self Join Limit Venue');
+    const { status, body } = await api('POST', `/api/venues/${venue.id}/queue/join`, { token: customer.token });
+    assert.equal(status, 429);
+    assert.match(body.error, /too many join attempts/);
+    assert.ok(Number(body.retry_after_seconds) > 0);
   });
 }
