@@ -17,6 +17,7 @@ const { buildQueueRouter } = require('./routes');
 const { buildAuthRouter } = require('./authRoutes');
 const { buildVenueRouter } = require('./venueRoutes');
 const { buildBillingRouter } = require('./billingRoutes');
+const { buildFeedbackRouter } = require('./feedbackRoutes');
 const { attachUser } = require('./auth');
 
 /**
@@ -89,6 +90,7 @@ function createApp(pool) {
   app.use('/api', buildVenueRouter(pool));
   app.use('/api', buildQueueRouter(pool));
   app.use('/api', buildBillingRouter(pool));
+  app.use('/api', buildFeedbackRouter(pool));
 
   // Centralized error handler — keep internals out of the response body.
   // eslint-disable-next-line no-unused-vars

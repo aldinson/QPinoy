@@ -7,12 +7,22 @@
  * across every serverless instance (see the schema.sql comment on
  * `rate_limits` for why in-memory counting is not an option here).
  *
- * Two shapes, because the two endpoints being protected want
- * different semantics:
+ * Three shapes, because what deserves to be counted differs by
+ * endpoint:
  *
  *   rateLimitMiddleware()  — every request counts. Used for the
  *                            location ping, where the thing being
  *                            limited IS the request volume.
+ *
+ *   rateLimitGate()        — only SUCCESSES count: the middleware
+ *                            checks the budget, the route spends it
+ *                            after the work lands. Used for remote
+ *                            self-join and feedback, where a refusal
+ *                            (already in that line, invalid rating)
+ *                            costs nothing and must therefore charge
+ *                            nothing — otherwise a few harmless
+ *                            mistakes lock someone out of a thing they
+ *                            never once did.
  *
  *   peek() / record() / reset()
  *                          — the caller decides what counts. Used for
@@ -146,7 +156,73 @@ function tooManyRequests(res, retryAfter, message) {
 }
 
 /**
+ * Express middleware that CHECKS the budget without spending it, and
+ * hands the route a `req.spendRateLimit()` to call once the work has
+ * actually succeeded.
+ *
+ * Use this wherever the thing being limited is an OUTCOME rather than
+ * an attempt — joining a line, sending an email. Counting attempts
+ * there charges the user for refusals that achieved nothing (a
+ * duplicate join, a validation error), so a handful of harmless
+ * mistakes locks out someone who never did the limited thing once.
+ * authRoutes.js applies the same split in reverse, counting only
+ * FAILED logins.
+ *
+ * Spend AFTER success, and await it: the gate reads the counter, so a
+ * write that lands after the response lets a concurrent burst all read
+ * the same stale total and pass together — the exact scripted case
+ * these limits exist for.
+ *
+ * @param {object}   pool
+ * @param {object}   options
+ * @param {number}   options.limit          max successes per window
+ * @param {number}   options.windowSeconds
+ * @param {function} options.key            (req) => bucket string, or null to skip limiting
+ * @param {string}   options.message        what the client is told on 429
+ */
+function rateLimitGate(pool, { limit, windowSeconds, key, message }) {
+  return async (req, res, next) => {
+    let bucket;
+    try {
+      bucket = key(req);
+    } catch {
+      bucket = null;
+    }
+    // Nothing to charge (e.g. anonymous) — let the route's own auth
+    // decide, and give it a no-op so it needn't special-case this.
+    if (!bucket) {
+      req.spendRateLimit = async () => {};
+      return next();
+    }
+
+    try {
+      const { hits, retryAfter } = await peek(pool, bucket, windowSeconds);
+      if (hits >= limit) return tooManyRequests(res, retryAfter, message);
+      res.setHeader('RateLimit-Limit', String(limit));
+      res.setHeader('RateLimit-Remaining', String(Math.max(0, limit - hits)));
+      req.spendRateLimit = async () => {
+        await record(pool, bucket, windowSeconds).catch((err) =>
+          console.error('[rateLimit] could not record a spend', err)
+        );
+      };
+      maybePurge(pool);
+      next();
+    } catch (err) {
+      // Fail open, same reasoning as the file header: a counter outage
+      // must not stop people using the app.
+      console.error('[rateLimit] counter unavailable, allowing request', err);
+      req.spendRateLimit = async () => {};
+      next();
+    }
+  };
+}
+
+/**
  * Express middleware: count every request, reject once over the limit.
+ *
+ * Right when the ATTEMPT itself is the cost being bounded (a location
+ * ping is work whether or not it changes anything). When it is the
+ * successful outcome that matters, reach for rateLimitGate above.
  *
  * @param {object}   pool
  * @param {object}   options
@@ -233,6 +309,12 @@ function rateLimitMiddleware(pool, { limit, windowSeconds, key, message }) {
  *      venue per account caps the damage at a single bogus slot, which
  *      staff clear with the no-show button.
  *
+ *  FEEDBACK      — 5 submissions per user per hour. This one sends an
+ *                  email, so an unbounded endpoint is a free way to
+ *                  flood the operator's inbox on demand and to get the
+ *                  sending address marked as spam. Five an hour is far
+ *                  above anyone with something genuine to say.
+ *
 
  * Known gap, stated rather than papered over: an attacker with many
  * source IPs can still grind one account, since each IP gets its own
@@ -245,6 +327,7 @@ const LIMITS = {
   LOGIN_IP: { limit: 60, windowSeconds: 15 * 60 },
   LOCATION: { limit: 30, windowSeconds: 60 },
   SELF_JOIN: { limit: 15, windowSeconds: 60 * 60 },
+  FEEDBACK: { limit: 5, windowSeconds: 60 * 60 },
 };
 
 module.exports = {
@@ -258,4 +341,5 @@ module.exports = {
   maybePurge,
   tooManyRequests,
   rateLimitMiddleware,
+  rateLimitGate,
 };

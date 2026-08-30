@@ -137,6 +137,10 @@ export const api = {
   // No auth required — a feature flag, not a secret. Lets the console
   // decide whether to show any billing UI at all before it knows which
   // venue (or whether the visitor is even signed in) it's dealing with.
+  // ── Feedback ────────────────────────────────────────────────
+  // venueId is optional — omit it for feedback about the app itself.
+  sendFeedback: ({ rating, comment, venueId }) => request('POST', '/feedback', { rating, comment, venueId }),
+
   getBillingConfig: () => request('GET', '/billing/config'),
   getBilling: (venueId) => request('GET', `/venues/${venueId}/billing`),
   startCheckout: (venueId, provider) => request('POST', `/venues/${venueId}/billing/checkout`, { provider }),

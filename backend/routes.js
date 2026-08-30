@@ -19,7 +19,7 @@ const { isWithinGeofence, isPlausibleCoordinate } = require('./geofence');
 const { getLiveEtaMinutes } = require('./distanceMatrixClient');
 const { requireAuth, requireVenueRole, requireUuidParams, STAFF_ROLES } = require('./auth');
 const { verifyEnrollmentToken, TokenError } = require('./tokens');
-const { LIMITS, bucketKey, clientIp, rateLimitMiddleware, peek, record, tooManyRequests } = require('./rateLimit');
+const { LIMITS, bucketKey, clientIp, rateLimitMiddleware, rateLimitGate } = require('./rateLimit');
 const { getSubscriptionState, isEnabled: isSubscriptionEnabled } = require('./subscriptions');
 
 /**
@@ -164,38 +164,18 @@ function buildQueueRouter(pool) {
    * payment flow, which doesn't exist yet) involved.
    */
   /**
-   * Checks the budget WITHOUT spending it. The spend happens after the
-   * join actually succeeds (below), mirroring how a failed login is
-   * counted in authRoutes.js — same idea, opposite trigger.
-   *
-   * Counting every attempt, the way a plain rateLimitMiddleware does,
-   * charged the user for outcomes that achieved nothing: tapping a
-   * venue you already hold a ticket at (409), one whose subscription
-   * has lapsed (402), or a stale link to a deleted venue (404) each
-   * burned a slot. Five of those and an honest customer was locked out
-   * for the rest of the hour without ever having joined a single line.
-   * What this limit exists to stop is a script enrolling into many
-   * DIFFERENT venues back to back — and that is a count of successes,
-   * so successes are what it counts.
+   * Charged per SUCCESSFUL join, not per attempt — see rateLimitGate.
+   * Tapping a venue you already hold a ticket at (409), one whose
+   * subscription has lapsed (402), or a stale link to a deleted venue
+   * (404) adds you to nothing, so none of them spend budget. Counting
+   * those locked honest customers out for the rest of the hour without
+   * their having joined a single line.
    */
-  async function selfJoinBudget(req, res, next) {
-    const bucket = bucketKey('self_join', 'user', req.user.id);
-    try {
-      const { hits, retryAfter } = await peek(pool, bucket, LIMITS.SELF_JOIN.windowSeconds);
-      if (hits >= LIMITS.SELF_JOIN.limit) {
-        return tooManyRequests(res, retryAfter, 'too many join attempts — slow down and try again shortly');
-      }
-      res.setHeader('RateLimit-Limit', String(LIMITS.SELF_JOIN.limit));
-      res.setHeader('RateLimit-Remaining', String(Math.max(0, LIMITS.SELF_JOIN.limit - hits)));
-      req.selfJoinBucket = bucket;
-      next();
-    } catch (err) {
-      // Fail open, same reasoning as rateLimit.js's own middleware: a
-      // transient counter outage must not stop people joining lines.
-      console.error('[rateLimit] self-join counter unavailable, allowing request', err);
-      next();
-    }
-  }
+  const selfJoinBudget = rateLimitGate(pool, {
+    ...LIMITS.SELF_JOIN,
+    key: (req) => (req.user ? bucketKey('self_join', 'user', req.user.id) : null),
+    message: 'too many join attempts — slow down and try again shortly',
+  });
 
   router.post(
     '/venues/:venueId/queue/join',
@@ -216,19 +196,8 @@ function buildQueueRouter(pool) {
         }
         if (!result.mutated) return res.status(404).json({ error: 'venue not found' });
 
-        // Only a real join spends budget. Awaited, not fire-and-forget:
-        // the gate above reads the counter, so a write that lands after
-        // the response would let a burst of concurrent joins all read
-        // the same stale total and sail through together — precisely
-        // the scripted case this limit exists to catch. A failed write
-        // is logged and swallowed rather than failing the request: the
-        // customer IS in the line at this point, and saying otherwise
-        // over a counter would be a lie.
-        if (req.selfJoinBucket) {
-          await record(pool, req.selfJoinBucket, LIMITS.SELF_JOIN.windowSeconds).catch((err) =>
-            console.error('[rateLimit] could not record self-join', err)
-          );
-        }
+        // Only a real join spends budget.
+        await req.spendRateLimit();
         res.status(201).json({ entry: result.entry });
       } catch (err) {
         next(err);

@@ -333,6 +333,41 @@ CREATE INDEX idx_subscription_payments_venue ON subscription_payments (venue_id,
 -- (touch_updated_at() isn't defined until then).
 
 -- ---------------------------------------------------------
+-- FEEDBACK — a customer's star rating and optional comment.
+--
+-- Stored here as the source of truth, and separately emailed to
+-- FEEDBACK_EMAIL_TO as a notification (backend/mailer.js). The row is
+-- written FIRST and the mail attempted after, deliberately in that
+-- order: SMTP is the flakiest dependency in this app and the one most
+-- likely to be unconfigured (it is optional, exactly like VAPID keys
+-- and the Maps key), and feedback a customer took the trouble to write
+-- must not evaporate because a mail server was down or a password was
+-- wrong. email_sent_at records whether the notification actually got
+-- out, so unsent feedback is findable rather than silently lost.
+-- ---------------------------------------------------------
+CREATE TABLE feedback (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- Who wrote it. ON DELETE SET NULL rather than CASCADE: if the
+    -- account goes away the feedback is still worth having, and it
+    -- stops being attributable, which is the right outcome for both.
+    user_id       UUID REFERENCES users(id) ON DELETE SET NULL,
+    -- Optional context: which venue this is about, when the customer
+    -- was in a line at the time. NULL means feedback about the app
+    -- itself, which is just as valid a thing to send.
+    venue_id      UUID REFERENCES venues(id) ON DELETE SET NULL,
+    rating        SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    comment       TEXT,
+    email_sent_at TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- "Newest feedback first" — how anyone would actually read this table.
+CREATE INDEX idx_feedback_created ON feedback (created_at DESC);
+-- "Which feedback never made it out by email" — the recovery query if
+-- SMTP was misconfigured for a while.
+CREATE INDEX idx_feedback_unsent ON feedback (created_at DESC) WHERE email_sent_at IS NULL;
+
+-- ---------------------------------------------------------
 -- RATE LIMITS — fixed-window counters, shared across instances.
 --
 -- Deliberately in Postgres rather than in process memory. The
@@ -383,6 +418,18 @@ CREATE INDEX idx_subscription_payments_venue ON subscription_payments (venue_id,
 --   );
 --   CREATE UNIQUE INDEX IF NOT EXISTS idx_subscription_payments_provider_ref ON subscription_payments (provider, provider_reference);
 --   CREATE INDEX IF NOT EXISTS idx_subscription_payments_venue ON subscription_payments (venue_id, created_at DESC);
+--
+--   CREATE TABLE IF NOT EXISTS feedback (
+--       id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+--       user_id       UUID REFERENCES users(id) ON DELETE SET NULL,
+--       venue_id      UUID REFERENCES venues(id) ON DELETE SET NULL,
+--       rating        SMALLINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+--       comment       TEXT,
+--       email_sent_at TIMESTAMPTZ,
+--       created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+--   );
+--   CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback (created_at DESC);
+--   CREATE INDEX IF NOT EXISTS idx_feedback_unsent ON feedback (created_at DESC) WHERE email_sent_at IS NULL;
 --   CREATE TRIGGER trg_touch_subscription_payments BEFORE UPDATE ON subscription_payments FOR EACH ROW EXECUTE FUNCTION touch_updated_at();
 -- ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS rate_limits (

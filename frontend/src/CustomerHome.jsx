@@ -21,6 +21,7 @@ import { COLORS, FONT_MONO } from './theme';
 import { api, ApiError } from './api';
 import { useAuth } from './auth';
 import { Screen, Card, Button, Alert } from './ui';
+import FeedbackCard from './FeedbackCard';
 
 const QUEUE_POLL_MS = 5000;
 const MIN_PING_INTERVAL_MS = 15000;
@@ -662,6 +663,13 @@ export default function CustomerHome() {
       <div className="mt-3">
         <NotificationsCard />
       </div>
+
+      {/* Only attach the feedback to a venue when there is exactly one
+          it could be about; zero or several go in as app feedback. */}
+      <FeedbackCard
+        venueId={entries.length === 1 ? entries[0].venue_id : undefined}
+        venueName={entries.length === 1 ? entries[0].venue_name : undefined}
+      />
 
       <div className="mt-6">
         <Button variant="secondary" onClick={signOut}>
