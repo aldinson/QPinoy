@@ -14,6 +14,8 @@ import {
   Store,
   Users,
   ListOrdered,
+  QrCode,
+  CheckCircle2,
 } from 'lucide-react';
 import { COLORS, FONT_MONO } from './theme';
 import { api, ApiError } from './api';
@@ -254,47 +256,57 @@ function EnrollmentQr({ venueId }) {
  * for a customer who does NOT already have a venue-specific link/QR
  * (that case is JoinVenue.jsx, reached via /join?venue=<id>); this one
  * lives right on the customer's own home screen instead.
+ *
+ * `joinedVenueIds` comes from the caller's real tickets (/me/queue),
+ * NOT from local state set at the moment of tapping Join. An earlier
+ * version tracked "joined" in this component and got it wrong twice
+ * over: the badge vanished on remount even though the ticket was still
+ * live, and a line joined any other way (staff scan, a /join link)
+ * still advertised a Join button. Server state is the only thing that
+ * actually knows.
  */
-function FindBusinessCard({ onJoined }) {
+function FindBusinessCard({ joinedVenueIds, onJoined }) {
   const [venues, setVenues] = useState(null); // null = still loading
   const [query, setQuery] = useState('');
   const [joiningId, setJoiningId] = useState(null);
-  // venueId -> 'joined' | an error message string
-  const [statusById, setStatusById] = useState({});
+  const [errorById, setErrorById] = useState({});
   const [loadError, setLoadError] = useState(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .listVenues()
-      .then(({ venues: rows }) => {
-        if (!cancelled) setVenues(rows);
-      })
-      .catch((err) => {
-        if (!cancelled) setLoadError(err.message || 'Could not load businesses');
-      });
-    return () => {
-      cancelled = true;
-    };
+  /**
+   * Re-fetched after every join, not just on mount: the headcount
+   * beside each business ("7 waiting") is live data, and leaving it
+   * frozen at whatever it was when the screen opened made a successful
+   * join look like it had done nothing at all.
+   */
+  const loadVenues = useCallback(async () => {
+    try {
+      const { venues: rows } = await api.listVenues();
+      setVenues(rows);
+      setLoadError(null);
+    } catch (err) {
+      setLoadError(err.message || 'Could not load businesses');
+    }
   }, []);
+
+  useEffect(() => {
+    loadVenues();
+  }, [loadVenues]);
 
   const filtered = (venues || []).filter((v) => v.name.toLowerCase().includes(query.trim().toLowerCase()));
 
   async function requestJoin(venue) {
     setJoiningId(venue.id);
-    setStatusById((s) => ({ ...s, [venue.id]: null }));
+    setErrorById((s) => ({ ...s, [venue.id]: null }));
     try {
       await api.selfJoin(venue.id);
-      setStatusById((s) => ({ ...s, [venue.id]: 'joined' }));
-      onJoined();
+      await Promise.all([onJoined(), loadVenues()]);
     } catch (err) {
       // Already holding a ticket here is a fine outcome to land on,
       // not an error to alarm over — same reasoning as JoinVenue.jsx.
       if (err instanceof ApiError && err.status === 409) {
-        setStatusById((s) => ({ ...s, [venue.id]: 'joined' }));
-        onJoined();
+        await Promise.all([onJoined(), loadVenues()]);
       } else {
-        setStatusById((s) => ({ ...s, [venue.id]: err.message || 'Could not join this line' }));
+        setErrorById((s) => ({ ...s, [venue.id]: err.message || 'Could not join this line' }));
       }
     } finally {
       setJoiningId(null);
@@ -302,7 +314,7 @@ function FindBusinessCard({ onJoined }) {
   }
 
   return (
-    <Card style={{ marginBottom: 12 }}>
+    <Card>
       <div className="text-sm font-semibold mb-1" style={{ color: COLORS.textOnInk }}>
         Join a line remotely
       </div>
@@ -338,8 +350,8 @@ function FindBusinessCard({ onJoined }) {
       ) : (
         <div className="flex flex-col gap-2 max-h-72 overflow-y-auto">
           {filtered.map((venue) => {
-            const status = statusById[venue.id];
-            const errorMsg = status && status !== 'joined' ? status : null;
+            const alreadyIn = joinedVenueIds.has(venue.id);
+            const errorMsg = errorById[venue.id];
             return (
               <div key={venue.id}>
                 <div
@@ -358,9 +370,12 @@ function FindBusinessCard({ onJoined }) {
                       {venue.people_in_line === 0 ? 'No one waiting' : `${venue.people_in_line} waiting`}
                     </div>
                   </div>
-                  {status === 'joined' ? (
-                    <span className="text-xs font-semibold shrink-0" style={{ color: COLORS.jade }}>
-                      In line
+                  {alreadyIn ? (
+                    <span
+                      className="inline-flex items-center gap-1 text-xs font-semibold shrink-0"
+                      style={{ color: COLORS.jade }}
+                    >
+                      <CheckCircle2 size={12} /> In line
                     </span>
                   ) : (
                     <Button onClick={() => requestJoin(venue)} disabled={joiningId === venue.id}>
@@ -379,6 +394,46 @@ function FindBusinessCard({ onJoined }) {
         </div>
       )}
     </Card>
+  );
+}
+
+/**
+ * Two ways into a line, presented as a choice rather than stacked on
+ * top of each other: join remotely from wherever you are, or walk in
+ * and have the front desk scan you. They're alternatives, and showing
+ * both at once read as one long confusing form.
+ */
+function CheckInModeTabs({ mode, onChange }) {
+  const tabs = [
+    { id: 'remote', label: 'Join remotely', icon: Search },
+    { id: 'walkin', label: 'Walk-in QR', icon: QrCode },
+  ];
+  return (
+    <div
+      className="flex gap-1 p-1 rounded-xl mb-3"
+      style={{ backgroundColor: COLORS.ink2, border: `1px solid ${COLORS.inkBorder}` }}
+      role="tablist"
+    >
+      {tabs.map((tab) => {
+        const active = mode === tab.id;
+        const Icon = tab.icon;
+        return (
+          <button
+            key={tab.id}
+            role="tab"
+            aria-selected={active}
+            onClick={() => onChange(tab.id)}
+            className="flex-1 inline-flex items-center justify-center gap-1.5 text-xs font-semibold px-3 py-2 rounded-lg"
+            style={{
+              backgroundColor: active ? COLORS.brass : 'transparent',
+              color: active ? COLORS.ink : COLORS.textOnInkDim,
+            }}
+          >
+            <Icon size={13} /> {tab.label}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
@@ -523,14 +578,19 @@ export default function CustomerHome() {
   const [entries, setEntries] = useState([]);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(true);
+  // 'remote' (search and join) | 'walkin' (show the check-in QR)
+  const [mode, setMode] = useState('remote');
+  const ticketsRef = useRef(null);
 
   const load = useCallback(async () => {
     try {
       const { entries: rows } = await api.myQueue();
       setEntries(rows);
       setError(null);
+      return rows;
     } catch (err) {
       setError(err.message || 'Could not load your place in line');
+      return null;
     } finally {
       setLoading(false);
     }
@@ -542,28 +602,57 @@ export default function CustomerHome() {
     return () => clearInterval(id);
   }, [load]);
 
+  /**
+   * Tickets render above the check-in section, so a join made while
+   * scrolled down to the business list would land entirely off-screen
+   * — the join worked, but nothing visibly happened where the customer
+   * was looking. Scroll the new ticket into view so the answer to
+   * "am I in?" is the thing they see next.
+   */
+  const handleJoined = useCallback(async () => {
+    const rows = await load();
+    if (rows && rows.length > 0) {
+      // Wait for the ticket to actually be in the DOM before scrolling to it.
+      requestAnimationFrame(() => {
+        ticketsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
+  }, [load]);
+
+  const joinedVenueIds = new Set(entries.map((e) => e.venue_id));
+
   return (
     <Screen subtitle={`Hi, ${user.full_name.split(' ')[0]}`} title={entries.length ? 'Your lines' : 'Ready to check in'}>
       <Alert>{error}</Alert>
 
-      {entries.map((entry) => (
-        <TicketCard key={entry.id} entry={entry} onChanged={load} />
-      ))}
+      <div ref={ticketsRef}>
+        {entries.map((entry) => (
+          <TicketCard key={entry.id} entry={entry} onChanged={load} />
+        ))}
+      </div>
 
       {!loading && entries.length === 0 && (
         <div className="text-sm mb-4" style={{ color: COLORS.textOnInkDim, lineHeight: 1.6 }}>
-          You're not in any line right now. Find a business below to join remotely, or show your
-          code at the front desk.
+          You're not in any line right now. Pick how you'd like to check in.
         </div>
       )}
 
-      <FindBusinessCard onJoined={load} />
+      <div className="mt-5 mb-1 text-xs font-semibold uppercase tracking-wide" style={{ color: COLORS.textOnInkDim, fontFamily: FONT_MONO }}>
+        Join a line
+      </div>
+      <CheckInModeTabs mode={mode} onChange={setMode} />
+      {mode === 'remote' ? (
+        <FindBusinessCard joinedVenueIds={joinedVenueIds} onJoined={handleJoined} />
+      ) : (
+        /* Exactly one active ticket is the only case where "which
+           venue's TTL setting applies" is unambiguous — zero or several
+           fall back to the system-wide default inside EnrollmentQr. */
+        <EnrollmentQr venueId={entries.length === 1 ? entries[0].venue_id : undefined} />
+      )}
 
-      <NotificationsCard />
-      {/* Exactly one active ticket is the only case where "which
-          venue's TTL setting applies" is unambiguous — zero or several
-          fall back to the system-wide default inside EnrollmentQr. */}
-      <EnrollmentQr venueId={entries.length === 1 ? entries[0].venue_id : undefined} />
+      <div className="mt-3">
+        <NotificationsCard />
+      </div>
 
       <div className="mt-6">
         <Button variant="secondary" onClick={signOut}>
