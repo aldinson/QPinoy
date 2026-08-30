@@ -15,6 +15,8 @@ const { createSessionToken, createEnrollmentToken, ENROLLMENT_TTL_SECONDS } = re
 const { requireAuth, isUuid } = require('./auth');
 const { isConfigured: isPushConfigured } = require('./push');
 const { LIMITS, bucketKey, clientIp, peek, record, reset, maybePurge, tooManyRequests } = require('./rateLimit');
+const { getLiveQueue } = require('./queueEngine');
+const { maskCustomerName } = require('./names');
 
 // Deliberately permissive: one @, no whitespace, a dot in the domain.
 // Anything stricter starts rejecting valid real-world addresses, and
@@ -240,12 +242,15 @@ function buildAuthRouter(pool) {
 
   /**
    * Every live ticket this customer holds, with their real position
-   * worked out server-side.
+   * worked out server-side, plus a `roster` of the venue's whole line
+   * in serve order so the queue actually looks like a queue rather than
+   * a single floating number.
    *
-   * Position is computed here rather than by shipping the whole line
-   * to the customer's phone and letting it count rows: the full queue
-   * is other customers' names and check-in status, which is nobody
-   * else's business. The customer gets their own row and two numbers.
+   * The roster is never the raw line, though: every OTHER customer's
+   * name is masked with maskCustomerName (their own is not — that's
+   * what lets them find themselves in the list). Nothing else about
+   * anyone else — phone, check-in state, exact ETA — is included, which
+   * stays staff-only via the real GET /venues/:venueId/queue.
    */
   router.get('/me/queue', requireAuth, async (req, res, next) => {
     try {
@@ -267,7 +272,20 @@ function buildAuthRouter(pool) {
           ORDER BY e.joined_at ASC`,
         [req.user.id]
       );
-      res.json({ entries: rows });
+
+      const entries = await Promise.all(
+        rows.map(async (entry) => {
+          const venueQueue = await getLiveQueue(pool, entry.venue_id);
+          const roster = venueQueue.map((row, i) => ({
+            position: i + 1,
+            name: row.id === entry.id ? row.customer_name : maskCustomerName(row.customer_name),
+            isMe: row.id === entry.id,
+          }));
+          return { ...entry, roster };
+        })
+      );
+
+      res.json({ entries });
     } catch (err) {
       next(err);
     }

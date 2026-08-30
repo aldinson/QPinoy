@@ -1,8 +1,22 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import QRCode from 'qrcode';
-import { MapPin, MapPinOff, Lock, AlertTriangle, Navigation, LogOut, RefreshCw, Bell, BellOff } from 'lucide-react';
+import {
+  MapPin,
+  MapPinOff,
+  Lock,
+  AlertTriangle,
+  Navigation,
+  LogOut,
+  RefreshCw,
+  Bell,
+  BellOff,
+  Search,
+  Store,
+  Users,
+  ListOrdered,
+} from 'lucide-react';
 import { COLORS, FONT_MONO } from './theme';
-import { api } from './api';
+import { api, ApiError } from './api';
 import { useAuth } from './auth';
 import { Screen, Card, Button, Alert } from './ui';
 
@@ -234,6 +248,176 @@ function EnrollmentQr({ venueId }) {
   );
 }
 
+/**
+ * "Join a line remotely" — search-as-you-type over every venue on the
+ * platform, then one tap to request a spot. This is the entry point
+ * for a customer who does NOT already have a venue-specific link/QR
+ * (that case is JoinVenue.jsx, reached via /join?venue=<id>); this one
+ * lives right on the customer's own home screen instead.
+ */
+function FindBusinessCard({ onJoined }) {
+  const [venues, setVenues] = useState(null); // null = still loading
+  const [query, setQuery] = useState('');
+  const [joiningId, setJoiningId] = useState(null);
+  // venueId -> 'joined' | an error message string
+  const [statusById, setStatusById] = useState({});
+  const [loadError, setLoadError] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .listVenues()
+      .then(({ venues: rows }) => {
+        if (!cancelled) setVenues(rows);
+      })
+      .catch((err) => {
+        if (!cancelled) setLoadError(err.message || 'Could not load businesses');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const filtered = (venues || []).filter((v) => v.name.toLowerCase().includes(query.trim().toLowerCase()));
+
+  async function requestJoin(venue) {
+    setJoiningId(venue.id);
+    setStatusById((s) => ({ ...s, [venue.id]: null }));
+    try {
+      await api.selfJoin(venue.id);
+      setStatusById((s) => ({ ...s, [venue.id]: 'joined' }));
+      onJoined();
+    } catch (err) {
+      // Already holding a ticket here is a fine outcome to land on,
+      // not an error to alarm over — same reasoning as JoinVenue.jsx.
+      if (err instanceof ApiError && err.status === 409) {
+        setStatusById((s) => ({ ...s, [venue.id]: 'joined' }));
+        onJoined();
+      } else {
+        setStatusById((s) => ({ ...s, [venue.id]: err.message || 'Could not join this line' }));
+      }
+    } finally {
+      setJoiningId(null);
+    }
+  }
+
+  return (
+    <Card style={{ marginBottom: 12 }}>
+      <div className="text-sm font-semibold mb-1" style={{ color: COLORS.textOnInk }}>
+        Join a line remotely
+      </div>
+      <div className="text-xs mb-3" style={{ color: COLORS.textOnInkDim, lineHeight: 1.5 }}>
+        Search for a business on QPinoy and request a spot in their line from wherever you are.
+      </div>
+
+      <Alert>{loadError}</Alert>
+
+      <div className="relative mb-2">
+        <Search
+          size={14}
+          color={COLORS.textOnInkDim}
+          style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)' }}
+        />
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search businesses…"
+          className="w-full pl-8 pr-3 py-2.5 rounded-lg text-sm outline-none"
+          style={{ backgroundColor: COLORS.ink, color: COLORS.textOnInk, border: `1px solid ${COLORS.inkBorder}` }}
+        />
+      </div>
+
+      {venues === null ? (
+        <div className="text-xs" style={{ color: COLORS.textOnInkDim }}>
+          Loading businesses…
+        </div>
+      ) : filtered.length === 0 ? (
+        <div className="text-xs" style={{ color: COLORS.textOnInkDim }}>
+          {venues.length === 0 ? 'No businesses are on QPinoy yet.' : 'No businesses match that search.'}
+        </div>
+      ) : (
+        <div className="flex flex-col gap-2 max-h-72 overflow-y-auto">
+          {filtered.map((venue) => {
+            const status = statusById[venue.id];
+            const errorMsg = status && status !== 'joined' ? status : null;
+            return (
+              <div key={venue.id}>
+                <div
+                  className="rounded-lg p-2.5 flex items-center gap-2.5"
+                  style={{ backgroundColor: COLORS.ink, border: `1px solid ${COLORS.inkBorder}` }}
+                >
+                  <div className="rounded-lg p-1.5 shrink-0" style={{ backgroundColor: `${COLORS.brass}22` }}>
+                    <Store size={14} color={COLORS.brass} />
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-semibold truncate" style={{ color: COLORS.textOnInk }}>
+                      {venue.name}
+                    </div>
+                    <div className="flex items-center gap-1 text-xs" style={{ color: COLORS.textOnInkDim }}>
+                      <Users size={11} />
+                      {venue.people_in_line === 0 ? 'No one waiting' : `${venue.people_in_line} waiting`}
+                    </div>
+                  </div>
+                  {status === 'joined' ? (
+                    <span className="text-xs font-semibold shrink-0" style={{ color: COLORS.jade }}>
+                      In line
+                    </span>
+                  ) : (
+                    <Button onClick={() => requestJoin(venue)} disabled={joiningId === venue.id}>
+                      {joiningId === venue.id ? 'Joining…' : 'Join'}
+                    </Button>
+                  )}
+                </div>
+                {errorMsg && (
+                  <div className="text-xs mt-1 px-1" style={{ color: COLORS.rust }}>
+                    {errorMsg}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/**
+ * The rest of the line, in serve order — every OTHER name arrives
+ * already masked from the server (see backend/names.js); only the
+ * caller's own row is ever their real name, which is what makes it
+ * possible to actually find yourself in the list.
+ */
+function RosterList({ roster }) {
+  if (!roster || roster.length === 0) return null;
+  return (
+    <div className="mt-3 pt-3" style={{ borderTop: `1px solid ${COLORS.inkBorder}` }}>
+      <div className="flex items-center gap-1.5 text-xs font-semibold mb-2" style={{ color: COLORS.textOnInkDim }}>
+        <ListOrdered size={13} /> The line right now
+      </div>
+      <div className="flex flex-col gap-1">
+        {roster.map((row) => (
+          <div
+            key={row.position}
+            className="flex items-center justify-between text-xs rounded-md px-2 py-1.5"
+            style={{
+              backgroundColor: row.isMe ? `${COLORS.brass}1a` : 'transparent',
+              color: row.isMe ? COLORS.textOnInk : COLORS.textOnInkDim,
+              fontWeight: row.isMe ? 700 : 400,
+            }}
+          >
+            <span style={{ fontFamily: FONT_MONO }}>#{row.position}</span>
+            <span className="truncate ml-2">
+              {row.name}
+              {row.isMe ? ' (you)' : ''}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 /** One live ticket, with position and the location-sharing control. */
 function TicketCard({ entry, onChanged }) {
   const [sharing, setSharing] = useState(false);
@@ -328,6 +512,8 @@ function TicketCard({ entry, onChanged }) {
         </Button>
       )}
       <Alert>{locationError}</Alert>
+
+      <RosterList roster={entry.roster} />
     </Card>
   );
 }
@@ -366,9 +552,12 @@ export default function CustomerHome() {
 
       {!loading && entries.length === 0 && (
         <div className="text-sm mb-4" style={{ color: COLORS.textOnInkDim, lineHeight: 1.6 }}>
-          You're not in any line right now. Show your code below at the front desk to join one.
+          You're not in any line right now. Find a business below to join remotely, or show your
+          code at the front desk.
         </div>
       )}
+
+      <FindBusinessCard onJoined={load} />
 
       <NotificationsCard />
       {/* Exactly one active ticket is the only case where "which

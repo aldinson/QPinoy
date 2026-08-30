@@ -621,6 +621,37 @@ if (!process.env.DATABASE_URL) {
     assert.equal(status, 400);
   });
 
+  // ── Venue directory ──────────────────────────────────────────────
+
+  test('GET /venues requires no auth and lists venues with a live headcount', async () => {
+    const owner = await register('dirowner', 'business');
+    const venue = await createVenue(owner.token, 'Directory Test Venue');
+
+    const { status, body } = await api('GET', '/api/venues'); // no token
+    assert.equal(status, 200);
+    const found = body.venues.find((v) => v.id === venue.id);
+    assert.ok(found, 'newly created venue should appear in the directory');
+    assert.equal(found.name, 'Directory Test Venue');
+    assert.equal(found.people_in_line, 0);
+  });
+
+  test('GET /venues?q= filters by a case-insensitive substring of the name', async () => {
+    const owner = await register('searchowner', 'business');
+    await createVenue(owner.token, 'Riverside Dermatology Clinic');
+    await createVenue(owner.token, 'Sunset Barbershop');
+
+    const { body } = await api('GET', '/api/venues?q=dermat');
+    assert.ok(body.venues.every((v) => v.name.toLowerCase().includes('dermat')));
+    assert.ok(body.venues.some((v) => v.name === 'Riverside Dermatology Clinic'));
+    assert.ok(!body.venues.some((v) => v.name === 'Sunset Barbershop'));
+  });
+
+  test('GET /venues?q= with no matches returns an empty list, not an error', async () => {
+    const { status, body } = await api('GET', '/api/venues?q=no-such-business-xyz');
+    assert.equal(status, 200);
+    assert.deepEqual(body.venues, []);
+  });
+
   // ── Remote self-join ────────────────────────────────────────────
 
   test('GET /venues/:id/public requires no auth and exposes only safe fields', async () => {
@@ -658,6 +689,37 @@ if (!process.env.DATABASE_URL) {
     const mine = await api('GET', '/api/me/queue', { token: customer.token });
     assert.equal(mine.body.entries.length, 1);
     assert.equal(mine.body.entries[0].venue_id, venue.id);
+  });
+
+  test('a customer sees the whole line in order, everyone else masked but their own name in full', async () => {
+    const owner = await register('rosterowner', 'business');
+    const venue = await createVenue(owner.token);
+
+    async function joinAs(fullName, localPart) {
+      const { body: reg } = await api('POST', '/api/auth/register', {
+        body: { email: `${localPart}${SUFFIX}`, password: 'a-good-password', fullName, phone: '0917 123 4567' },
+      });
+      const { status } = await api('POST', `/api/venues/${venue.id}/queue/join`, { token: reg.token });
+      assert.equal(status, 201, `join failed for ${fullName}`);
+      return reg;
+    }
+
+    const alice = await joinAs('Alice Chen', 'rosteralice');
+    const bob = await joinAs('Bob Martinez', 'rosterbob');
+
+    const aliceView = await api('GET', '/api/me/queue', { token: alice.token });
+    const roster = aliceView.body.entries[0].roster;
+    assert.deepEqual(roster, [
+      { position: 1, name: 'Alice Chen', isMe: true },
+      { position: 2, name: 'B** M.', isMe: false },
+    ]);
+
+    // Bob's own view mirrors it — his name in full, Alice's masked.
+    const bobView = await api('GET', '/api/me/queue', { token: bob.token });
+    assert.deepEqual(bobView.body.entries[0].roster, [
+      { position: 1, name: 'A**** C.', isMe: false },
+      { position: 2, name: 'Bob Martinez', isMe: true },
+    ]);
   });
 
   test('remote join is refused for an anonymous caller', async () => {

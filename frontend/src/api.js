@@ -105,6 +105,10 @@ export const api = {
   // ── Venues & staff ──────────────────────────────────────────
   myVenues: () => request('GET', '/venues/mine'),
   getVenue: (venueId) => request('GET', `/venues/${venueId}`),
+  // No auth required — the "find a business" directory a customer
+  // searches to join a line remotely without already holding that
+  // venue's own link/QR. `q` is optional; omitting it lists everything.
+  listVenues: (q) => request('GET', `/venues${q ? `?q=${encodeURIComponent(q)}` : ''}`),
   // No auth required — this is what a "join our line" link/QR resolves
   // to, safe to fetch before the visitor has signed in.
   getVenuePublic: (venueId) => request('GET', `/venues/${venueId}/public`),

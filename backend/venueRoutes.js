@@ -107,6 +107,44 @@ function buildVenueRouter(pool) {
   });
 
   /**
+   * The venue directory a customer searches to find a business and join
+   * its line remotely, without ever having been handed a venue-specific
+   * link/QR first — the "browse and request to join" entry point
+   * alongside the existing "I already have this venue's link" one
+   * (JoinVenue.jsx / GET /venues/:venueId/public below).
+   *
+   * Public, no auth: browsing what's on the platform shouldn't require
+   * an account any more than viewing a single venue's public page does.
+   * `?q=` does the substring filtering server-side so the frontend's
+   * "searchable dropdown" doesn't have to fetch and hold every venue on
+   * the platform just to filter three of them client-side; omitting it
+   * returns the full list, which is what the dropdown loads on open.
+   *
+   * Deliberately not gated on subscription status (see
+   * requireActiveSubscription in routes.js): a venue that can't accept
+   * new customers right now still shows up here, and the join attempt
+   * itself is where that surfaces as a clear error — hiding it here
+   * would just make an existing venue mysteriously vanish and reappear.
+   */
+  router.get('/venues', async (req, res, next) => {
+    const q = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    try {
+      const { rows } = await pool.query(
+        `SELECT v.id, v.name, v.address,
+                (SELECT count(*)::int FROM queue_entries e
+                  WHERE e.venue_id = v.id AND e.status IN ('waiting', 'serving')) AS people_in_line
+           FROM venues v
+          WHERE $1 = '' OR v.name ILIKE '%' || $1 || '%'
+          ORDER BY v.name ASC`,
+        [q]
+      );
+      res.json({ venues: rows });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  /**
    * Public venue info — no auth required. This is what a "join our line
    * remotely" link/QR (e.g. printed at the front desk, or shared on the
    * venue's own site or social page) resolves to before a customer signs
