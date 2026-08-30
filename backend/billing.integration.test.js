@@ -296,7 +296,7 @@ if (!process.env.DATABASE_URL) {
     assert.equal(rows[0].provider, 'paymongo');
     assert.equal(rows[0].provider_reference, 'cs_fake_1');
     assert.equal(rows[0].status, 'pending');
-    assert.equal(rows[0].amount_centavos, 99900);
+    assert.equal(rows[0].amount_centavos, 39900);
   });
 
   test('a configured PayPal checkout creates a pending payment row and returns the approve URL', async (t) => {

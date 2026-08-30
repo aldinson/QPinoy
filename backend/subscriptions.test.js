@@ -7,8 +7,8 @@ const { PLAN, TRIAL_DAYS, isEnabled, computeTrialEndsAt, getSubscriptionState, c
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-test('PLAN price defaults to ₱999.00 (99900 centavos) when no env override is set', () => {
-  assert.equal(PLAN.priceCentavos, 99900);
+test('PLAN price defaults to ₱399.00 (39900 centavos) when no env override is set', () => {
+  assert.equal(PLAN.priceCentavos, 39900);
   assert.equal(PLAN.currency, 'PHP');
 });
 

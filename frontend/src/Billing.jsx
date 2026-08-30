@@ -4,7 +4,7 @@ import { COLORS, FONT_MONO } from './theme';
 import { api } from './api';
 import { Screen, Card, Button, Alert } from './ui';
 
-/** ₱999.00, from 99900 centavos — the only place this app formats money for display. */
+/** ₱399.00, from 39900 centavos — the only place this app formats money for display. */
 function formatCentavos(centavos) {
   return `₱${(centavos / 100).toLocaleString('en-PH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }

@@ -34,7 +34,7 @@
 // falling back to a clearly-labeled default. Stored/compared in
 // centavos throughout the backend — see paymongo.js and paypal.js —
 // so there's never a rounding surprise from float pesos.
-const DEFAULT_PLAN_PRICE_PHP_CENTAVOS = 99900; // ₱999.00
+const DEFAULT_PLAN_PRICE_PHP_CENTAVOS = 39900; // ₱399.00
 const PLAN_PRICE_PHP_CENTAVOS = Number.isInteger(Number(process.env.SUBSCRIPTION_PRICE_PHP_CENTAVOS))
   ? Number(process.env.SUBSCRIPTION_PRICE_PHP_CENTAVOS)
   : DEFAULT_PLAN_PRICE_PHP_CENTAVOS;
