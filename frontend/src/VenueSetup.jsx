@@ -4,6 +4,7 @@ import { COLORS } from './theme';
 import { api } from './api';
 import { useAuth } from './auth';
 import { Screen, Card, Button, Alert, Field } from './ui';
+import FeedbackCard from './FeedbackCard';
 
 /**
  * First-run setup for a business account: create the venue, which
@@ -132,7 +133,13 @@ export default function VenueSetup({ navigate }) {
         </Button>
       </form>
 
+      {/* No venue yet, so nothing to attach this to — general
+          feedback about the app. */}
       <div className="mt-6">
+        <FeedbackCard />
+      </div>
+
+      <div className="mt-2">
         <Button variant="secondary" onClick={signOut}>
           <LogOut size={14} /> Sign out
         </Button>

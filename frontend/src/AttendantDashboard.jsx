@@ -29,6 +29,7 @@ import { api } from './api';
 import { useAuth } from './auth';
 import { Button, Alert, Card, Field, Select } from './ui';
 import QrScanner from './QrScanner';
+import FeedbackCard from './FeedbackCard';
 
 const POLL_MS = 4000;
 
@@ -609,7 +610,14 @@ export default function AttendantDashboard({ venueId, navigate }) {
           </div>
         )}
 
-        <div className="mt-6 flex flex-wrap gap-2">
+        {/* Staff have as much to say about QPinoy as customers do —
+            more, since they use it all day. venueId attaches the note
+            to the line they actually run. */}
+        <div className="mt-6">
+          <FeedbackCard venueId={venueId} venueName={venue?.name} relation="work" />
+        </div>
+
+        <div className="mt-2 flex flex-wrap gap-2">
           <Button variant="secondary" onClick={() => runAction('__rebalance__', () => api.rebalance(venueId))}>
             <RefreshCw size={14} /> Rebalance
           </Button>

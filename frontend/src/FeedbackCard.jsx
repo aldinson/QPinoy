@@ -9,16 +9,26 @@ const MAX_COMMENT_LENGTH = 2000; // matches feedbackRoutes.js
 /**
  * "How are we doing?" — a star rating plus an optional note.
  *
+ * Used by everyone: customers on their home screen, and owners,
+ * managers and attendants on the console. Staff use this product far
+ * more hours a day than any customer does, so they are the last people
+ * who should have to go find another channel to say something about
+ * it. The backend route is plain requireAuth for the same reason.
+ *
  * Collapsed to a single line until tapped: this sits underneath the
- * things a customer actually came here to do, and an always-open form
+ * things people actually came here to do, and an always-open form
  * would compete with them for attention on a small screen.
  *
- * `venueId` attaches the feedback to a specific venue when the
- * customer is in exactly one line — with none, or several, there is no
- * unambiguous answer to "which venue is this about", so it goes in as
- * general app feedback rather than guessing wrong.
+ * `venueId` attaches the note to a specific venue when there is an
+ * unambiguous one — the single line a customer is in, or the line a
+ * staff member is running. With none, or several, it files as general
+ * app feedback rather than guessing wrong.
+ *
+ * `relation` only changes wording: 'visit' for a customer, 'work' for
+ * staff, because "about your visit to Serenity Spa" is plainly wrong
+ * said to the person running Serenity Spa's front desk.
  */
-export default function FeedbackCard({ venueId, venueName }) {
+export default function FeedbackCard({ venueId, venueName, relation = 'visit' }) {
   const [open, setOpen] = useState(false);
   const [rating, setRating] = useState(0);
   const [hovered, setHovered] = useState(0);
@@ -83,7 +93,11 @@ export default function FeedbackCard({ venueId, venueName }) {
         Rate your experience
       </div>
       <div className="text-xs mb-3" style={{ color: COLORS.textOnInkDim, lineHeight: 1.5 }}>
-        {venueName ? `About your visit to ${venueName}.` : 'About the QPinoy app.'}
+        {!venueName
+          ? 'About the QPinoy app.'
+          : relation === 'work'
+          ? `About running the line at ${venueName}.`
+          : `About your visit to ${venueName}.`}
       </div>
 
       <Alert>{error}</Alert>

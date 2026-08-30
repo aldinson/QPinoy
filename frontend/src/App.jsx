@@ -13,6 +13,7 @@ import BillingReturn from './BillingReturn';
 import QueueSimulator from './QueueSimulator';
 import InstallPrompt from './InstallPrompt';
 import { Screen, Card, Button } from './ui';
+import FeedbackCard from './FeedbackCard';
 
 /**
  * Deliberately no router dependency — a handful of static paths and
@@ -109,7 +110,13 @@ function VenuePicker({ navigate }) {
           </button>
         ))}
       </div>
+      {/* Several venues here, so which one this is about is
+          ambiguous — files as general app feedback. */}
       <div className="mt-6">
+        <FeedbackCard />
+      </div>
+
+      <div className="mt-2">
         <Button variant="secondary" onClick={signOut}>
           Sign out
         </Button>

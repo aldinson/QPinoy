@@ -9,6 +9,17 @@
 -- differently on the second run.
 --
 -- Usage:  psql "$DATABASE_URL" -f seed.sql
+--
+-- ⚠ ALWAYS follow this with `npm run db:seed:accounts`, or use
+--   `npm run db:setup`, which chains both in the right order.
+--
+--   Deleting the demo venue below cascades to venue_members (see
+--   schema.sql), so running this file ALONE silently strips
+--   owner@/manager@/attendant@qpinoy.demo of their access: they can
+--   still log in, but land on the "create your venue" onboarding
+--   screen instead of the console, as though the venue were gone.
+--   seedAccounts.js re-grants those memberships and is idempotent, so
+--   re-running it is always safe.
 -- =========================================================
 
 BEGIN;
