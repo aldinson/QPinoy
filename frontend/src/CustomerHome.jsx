@@ -537,9 +537,18 @@ function TicketCard({ entry, onChanged }) {
           : `${entry.people_ahead} ${entry.people_ahead === 1 ? 'person' : 'people'} ahead of you.`}
       </div>
 
-      <div className="flex items-center gap-2 text-sm font-semibold mb-1" style={{ color: COLORS.textOnInk }}>
-        {entry.is_checked_in ? <MapPin size={15} color={COLORS.jade} /> : <MapPinOff size={15} color={COLORS.rust} />}
-        {entry.is_checked_in ? 'Checked in at venue' : 'Not checked in yet'}
+      {/* Two DIFFERENT facts, previously blurred into one line that just
+          said "Not checked in yet" — which read as "your join didn't
+          work" when it actually meant "we can't see you at the venue".
+          Holding a spot is settled the moment you join; being at the
+          venue is a live geofence signal that starts out false for
+          every remote join, by definition. */}
+      <div className="flex items-center gap-2 text-sm font-semibold mb-1" style={{ color: COLORS.jade }}>
+        <CheckCircle2 size={15} /> You're in this line
+      </div>
+      <div className="flex items-center gap-2 text-sm" style={{ color: COLORS.textOnInk }}>
+        {entry.is_checked_in ? <MapPin size={15} color={COLORS.jade} /> : <MapPinOff size={15} color={COLORS.textOnInkDim} />}
+        {entry.is_checked_in ? "We can see you're at the venue" : 'Not at the venue yet'}
       </div>
       {entry.is_override_locked && (
         <div className="flex items-center gap-1.5 text-xs mt-1" style={{ color: COLORS.indigo }}>
